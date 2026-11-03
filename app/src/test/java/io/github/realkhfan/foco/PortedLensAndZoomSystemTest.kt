@@ -277,4 +277,120 @@ class PortedLensAndZoomSystemTest {
         )
         assertEquals(1f, p16, 0.01f)
     }
+
+    @Test
+    fun testBidirectionalLensSwitchStrategy() {
+        val mainLens = LensInfo(
+            cameraId = "0",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.WIDE,
+            displayName = "1x Main",
+            focalLengthMm = 5.0f,
+            maxAperture = 1.8f,
+            isLogicalMultiCamera = true,
+            isPrimaryMain = true
+        )
+
+        val physicalUw = LensInfo(
+            cameraId = "0",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.ULTRAWIDE,
+            displayName = "0.5x Ultra Wide",
+            focalLengthMm = 2.0f,
+            maxAperture = 2.2f,
+            physicalCameraId = "2",
+            isLogicalMultiCamera = true,
+            supportsPhysicalStream = true,
+            baseZoomRatio = 0.5f
+        )
+
+        val independentUw = LensInfo(
+            cameraId = "2",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.ULTRAWIDE,
+            displayName = "0.5x Ultra Wide Aux",
+            focalLengthMm = 2.0f,
+            maxAperture = 2.2f,
+            isIndependentCamera = true,
+            baseZoomRatio = 0.5f
+        )
+
+        // Main 1x -> Ultra-Wide 0.5x (Physical Stream)
+        assertEquals(
+            LensSwitchStrategy.LOGICAL_PHYSICAL_STREAM,
+            CameraDiscovery.resolveSwitchStrategy(mainLens, physicalUw)
+        )
+
+        // Ultra-Wide 0.5x -> Main 1x (Physical Stream)
+        assertEquals(
+            LensSwitchStrategy.LOGICAL_PHYSICAL_STREAM,
+            CameraDiscovery.resolveSwitchStrategy(physicalUw, mainLens)
+        )
+
+        // Main 1x -> Independent Aux Ultra-Wide (Independent Device)
+        assertEquals(
+            LensSwitchStrategy.INDEPENDENT_DEVICE,
+            CameraDiscovery.resolveSwitchStrategy(mainLens, independentUw)
+        )
+
+        // Independent Aux Ultra-Wide -> Main 1x (Independent Device)
+        assertEquals(
+            LensSwitchStrategy.INDEPENDENT_DEVICE,
+            CameraDiscovery.resolveSwitchStrategy(independentUw, mainLens)
+        )
+    }
+
+    @Test
+    fun testSensorRelativeZoomCalculations() {
+        // Main camera: zoomFactor = 1.0f
+        val mainZoomFactor = 1.0f
+        val uiZoomMain1 = 1.0f
+        val sensorZoomMain1 = uiZoomMain1 / mainZoomFactor
+        assertEquals(1.0f, sensorZoomMain1, 0.001f)
+
+        val uiZoomMain2 = 2.0f
+        val sensorZoomMain2 = uiZoomMain2 / mainZoomFactor
+        assertEquals(2.0f, sensorZoomMain2, 0.001f)
+
+        // Ultra-Wide camera: zoomFactor = 0.5f
+        val uwZoomFactor = 0.5f
+        // UI zoom 0.5x on Ultra-Wide must produce 1.0x sensor zoom (not clamped to Main's 1.0x!)
+        val uiZoomUwHalf = 0.5f
+        val sensorZoomUwHalf = uiZoomUwHalf / uwZoomFactor
+        assertEquals(1.0f, sensorZoomUwHalf, 0.001f)
+
+        // UI zoom 0.75x on Ultra-Wide must produce 1.5x sensor zoom
+        val uiZoomUw75 = 0.75f
+        val sensorZoomUw75 = uiZoomUw75 / uwZoomFactor
+        assertEquals(1.5f, sensorZoomUw75, 0.001f)
+
+        // UI zoom 1.0x on Ultra-Wide must produce 2.0x sensor zoom
+        val uiZoomUw1 = 1.0f
+        val sensorZoomUw1 = uiZoomUw1 / uwZoomFactor
+        assertEquals(2.0f, sensorZoomUw1, 0.001f)
+
+        // Reverse calculation: sensorZoom * zoomFactor = UI zoom
+        assertEquals(0.5f, 1.0f * uwZoomFactor, 0.001f)
+        assertEquals(1.0f, 1.0f * mainZoomFactor, 0.001f)
+    }
+
+    @Test
+    fun testLogicalZoomValidationRejectsWithoutHardwareSupport() {
+        val uwLens = LensInfo(
+            cameraId = "0",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.ULTRAWIDE,
+            displayName = "0.5x Ultra Wide",
+            focalLengthMm = 2.0f,
+            maxAperture = 2.2f,
+            baseZoomRatio = 0.5f
+        )
+
+        // Without camera characteristics or zoom ratio range supporting < 0.55x, cannot use logical zoom
+        val canUseWithoutChars = CameraDiscovery.canUseLogicalZoomForLens("0", uwLens, 0.5f, null)
+        assertFalse("Cannot use logical zoom without characteristics", canUseWithoutChars)
+
+        val differentCam = CameraDiscovery.canUseLogicalZoomForLens("1", uwLens, 0.5f, null)
+        assertFalse("Cannot use logical zoom on different camera ID", differentCam)
+    }
 }

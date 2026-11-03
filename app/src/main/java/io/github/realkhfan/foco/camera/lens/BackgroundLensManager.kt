@@ -62,6 +62,8 @@ class BackgroundLensManager(
     private val standbySessionGen = AtomicInteger(0)
     private val standbyDeviceGen = AtomicInteger(0)
 
+    var onFrameAvailable: ((PreviewStreamSource) -> Unit)? = null
+
     fun setBackgroundHandler(handler: Handler) {
         backgroundHandler = handler
     }
@@ -71,6 +73,9 @@ class BackgroundLensManager(
     }
 
     fun getStandbyLens(): LensInfo? = standbyLens
+    fun getStandbyCameraDevice(): CameraDevice? = standbyCameraDevice
+    fun getStandbyCaptureSession(): CameraCaptureSession? = standbyCaptureSession
+    fun getStandbySurface(): Surface? = standbySurface
 
     fun detectSimultaneousStreamingMode(mainLens: LensInfo?, secondaryLens: LensInfo?): DualStreamingMode {
         if (mainLens == null || secondaryLens == null) return DualStreamingMode.NONE
@@ -128,9 +133,9 @@ class BackgroundLensManager(
 
         // Separate CameraDevices
         val existingCam = standbyCameraDevice
-        if (existingCam != null && existingCam.id == secondaryLens.cameraId && standbyCaptureSession != null) {
+        if (existingCam != null && existingCam.id == secondaryLens.cameraId && standbyCaptureSession != null && isStreaming.get()) {
             _status.value = BackgroundCameraStatus.READY_QUIET
-            isStreaming.set(true)
+            Log.i(TAG, "[BACKGROUND_LENS] Reusing already prepared background stream on camera ${existingCam.id}")
             return
         }
 
@@ -170,7 +175,15 @@ class BackgroundLensManager(
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    Log.w(TAG, "Standby camera ${camera.id} error: $error")
+                    val errDesc = when (error) {
+                        CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE -> "MAX_CAMERAS_IN_USE (hardware concurrency limit)"
+                        CameraDevice.StateCallback.ERROR_CAMERA_IN_USE -> "CAMERA_IN_USE"
+                        CameraDevice.StateCallback.ERROR_CAMERA_DISABLED -> "CAMERA_DISABLED"
+                        CameraDevice.StateCallback.ERROR_CAMERA_DEVICE -> "CAMERA_DEVICE"
+                        CameraDevice.StateCallback.ERROR_CAMERA_SERVICE -> "CAMERA_SERVICE"
+                        else -> "error code $error"
+                    }
+                    Log.w(TAG, "[BACKGROUND_LENS] Standby camera ${camera.id} error: $errDesc")
                     if (standbyCameraDevice == camera || standbyCameraDevice == null) {
                         release()
                         _status.value = BackgroundCameraStatus.UNAVAILABLE
@@ -209,20 +222,24 @@ class BackgroundLensManager(
                     }
                     standbyCaptureSession = session
                     isPreparingStandby.set(false)
-                    isStreaming.set(true)
-                    _status.value = BackgroundCameraStatus.READY_QUIET
+                    // Remain in PREPARING until the first valid frame arrives in onCaptureCompleted
+                    _status.value = BackgroundCameraStatus.PREPARING
 
                     try {
                         session.setRepeatingRequest(requestBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
                             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                                if (_status.value != BackgroundCameraStatus.READY_QUIET) {
+                                val firstFrame = !isStreaming.getAndSet(true)
+                                if (firstFrame || _status.value != BackgroundCameraStatus.READY_QUIET) {
                                     _status.value = BackgroundCameraStatus.READY_QUIET
+                                    Log.i(TAG, "[BACKGROUND_LENS] First valid target preview frame arrived on standby camera ${camera.id} (${lens.displayName})")
+                                    onFrameAvailable?.invoke(PreviewStreamSource.ULTRAWIDE)
                                 }
                             }
                         }, backgroundHandler ?: mainHandler)
-                        Log.i(TAG, "Standby session configured on camera ID ${camera.id} (${lens.displayName})")
+                        Log.i(TAG, "[BACKGROUND_LENS] Standby session configured on camera ID ${camera.id} (${lens.displayName}). Awaiting preview frames...")
                     } catch (e: Exception) {
                         Log.w(TAG, "Failed repeating request on standby camera ${camera.id}", e)
+                        _status.value = BackgroundCameraStatus.UNAVAILABLE
                     }
                 }
 

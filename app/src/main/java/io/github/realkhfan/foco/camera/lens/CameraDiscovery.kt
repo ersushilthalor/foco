@@ -426,11 +426,60 @@ object CameraDiscovery {
         }
 
         // Same underlying CameraDevice:
-        // Check if target lens specifies a physical camera ID inside logical multi-camera
-        if (targetLens.isLogicalMultiCamera && targetLens.physicalCameraId != null && targetLens.supportsPhysicalStream) {
+        // Check if either target lens or current lens specifies a physical camera ID inside logical multi-camera
+        if (targetLens.isLogicalMultiCamera &&
+            ((targetLens.physicalCameraId != null && targetLens.supportsPhysicalStream) ||
+             (currentLens.physicalCameraId != null && currentLens.physicalCameraId != targetLens.physicalCameraId))
+        ) {
             return LensSwitchStrategy.LOGICAL_PHYSICAL_STREAM
         }
 
         return LensSwitchStrategy.LOGICAL_ZOOM
+    }
+
+    /**
+     * Checks whether the logical camera device can genuinely handle the target lens and zoom ratio
+     * using CONTROL_ZOOM_RATIO without binding a dedicated physical camera stream or auxiliary camera.
+     */
+    fun canUseLogicalZoomForLens(
+        cameraId: String,
+        lens: LensInfo,
+        targetZoom: Float,
+        characteristics: CameraCharacteristics?
+    ): Boolean {
+        if (lens.cameraId != cameraId) return false
+        val chars = characteristics ?: return false
+        val isLogicalMulti = lens.isLogicalMultiCamera ||
+            (chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA
+            ) == true)
+
+        if (lens.lensType == LensType.ULTRAWIDE || targetZoom < 0.95f) {
+            // CONTROL_ZOOM_RATIO genuinely supports < 1.0x ONLY if zoomRange.lower <= 0.55f
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                if (zoomRange != null && zoomRange.lower <= 0.55f) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        if (!isLogicalMulti) {
+            return lens.physicalCameraId == null || lens.physicalCameraId == cameraId
+        }
+        if (lens.physicalCameraId == null || !lens.supportsPhysicalStream) {
+            return true
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            if (zoomRange != null) {
+                val neededRatio = minOf(lens.baseZoomRatio, targetZoom)
+                if (zoomRange.lower <= neededRatio + 0.05f) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 }
