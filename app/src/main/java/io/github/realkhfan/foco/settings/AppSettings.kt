@@ -26,6 +26,8 @@ enum class SettingKey(val needsRebind: Boolean) {
     LOCATION(false), SHUTTER_SOUND(false), HAPTICS(false), GRID(false), LEVEL(false),
     QR(true), ULTRA_HDR(true), MIRROR_FRONT(false), VOLUME_KEYS(false), STRIP_DEVICE_INFO(false),
     PROCESSING(true), ZOOM_DETAIL(false), QUICK_ACCESS(false), DIRTY_LENS(false),
+    BACKGROUND_LENS_PREPARATION(false), INSTANT_LENS_SWITCHING(false), AUTO_LENS_SELECTION(false),
+    ZOOM_TRANSITION_ANIMATION(false), LENS_HANDOFF_SETTING(false),
 }
 
 /**
@@ -46,6 +48,14 @@ class AppSettings(context: Context) {
     var resolution by enumPref("resolution", ResolutionSetting.MP12)
     var raw by boolPref("raw", false)
     var manualLens by boolPref("manual_lens", false)
+
+    // Lens & Zoom settings
+    var backgroundLensPreparation by boolPref("background_lens_prep", true)
+    var instantLensSwitching by boolPref("instant_lens_switch", true)
+    var autoLensSelection by boolPref("auto_lens_selection", false)
+    var zoomTransitionAnimation by boolPref("zoom_transition_anim", true)
+    var lensSwitchOverlapDurationSec by floatPref("lens_switch_overlap_duration", 0.3f)
+    var switchPointMm by floatPref("switch_point_mm", 23.0f)
 
     // Video
     var videoResolution by enumPref("video_resolution", VideoResolution.UHD)
@@ -79,6 +89,15 @@ class AppSettings(context: Context) {
         override fun setValue(thisRef: Any?, property: KProperty<*>, value: Boolean) {
             state.value = value
             prefs.edit { putBoolean(key, value) }
+        }
+    }
+
+    private fun floatPref(key: String, default: Float) = object : ReadWriteProperty<Any?, Float> {
+        private val state = mutableStateOf(prefs.getFloat(key, default))
+        override fun getValue(thisRef: Any?, property: KProperty<*>) = state.value
+        override fun setValue(thisRef: Any?, property: KProperty<*>, value: Float) {
+            state.value = value
+            prefs.edit { putFloat(key, value) }
         }
     }
 

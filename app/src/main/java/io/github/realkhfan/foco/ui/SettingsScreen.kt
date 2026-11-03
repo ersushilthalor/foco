@@ -71,6 +71,60 @@ fun SettingsScreen(state: AppState, settings: AppSettings, actions: CameraAction
                     settings.dirtyLens = it
                 }
             }
+            item { Section("Lens & Zoom") }
+            item {
+                SwitchRow(
+                    "Background lens preparation",
+                    "Keep secondary lenses prepared in background for instant switching",
+                    settings.backgroundLensPreparation,
+                ) {
+                    settings.backgroundLensPreparation = it
+                    actions.settingChanged(SettingKey.BACKGROUND_LENS_PREPARATION)
+                }
+            }
+            item {
+                SwitchRow(
+                    "Instant lens switching",
+                    "Instant switching between physical lenses without delay or camera reopening",
+                    settings.instantLensSwitching,
+                ) {
+                    settings.instantLensSwitching = it
+                    actions.settingChanged(SettingKey.INSTANT_LENS_SWITCHING)
+                }
+            }
+            item {
+                SwitchRow(
+                    "Automatic lens selection",
+                    "Automatically select ultra-wide or telephoto based on subject distance and zoom",
+                    settings.autoLensSelection,
+                ) {
+                    settings.autoLensSelection = it
+                    actions.settingChanged(SettingKey.AUTO_LENS_SELECTION)
+                }
+            }
+            item {
+                SwitchRow(
+                    "Zoom transition animation",
+                    "Smooth continuous zoom and lens handoff animation",
+                    settings.zoomTransitionAnimation,
+                ) {
+                    settings.zoomTransitionAnimation = it
+                    actions.settingChanged(SettingKey.ZOOM_TRANSITION_ANIMATION)
+                }
+            }
+            item {
+                val switchOptions = listOf("23mm (1.0×)", "28mm (1.2×)", "35mm (1.5×)", "50mm (2.2×)")
+                val switchPoints = listOf(23f, 28f, 35f, 50f)
+                val selectedIdx = switchPoints.indexOfFirst { kotlin.math.abs(it - settings.switchPointMm) < 1f }.let { if (it >= 0) it else 0 }
+                ChoiceRow(
+                    "Lens handoff switch point",
+                    switchOptions,
+                    selectedIdx,
+                ) {
+                    settings.switchPointMm = switchPoints[it]
+                    actions.settingChanged(SettingKey.LENS_HANDOFF_SETTING)
+                }
+            }
             item { Section("Camera") }
             item {
                 SwitchRow("Show quick access controls", "One-tap buttons for flash, timer and ratio at the top", settings.quickAccess) {

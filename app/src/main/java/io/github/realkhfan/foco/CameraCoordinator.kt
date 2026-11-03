@@ -541,6 +541,11 @@ class CameraCoordinator(
                 state.manualLensId = null
                 engine.rebind()
             }
+            SettingKey.BACKGROUND_LENS_PREPARATION -> engine.backgroundLensPrepChanged()
+            SettingKey.INSTANT_LENS_SWITCHING -> engine.instantLensSwitchingChanged()
+            SettingKey.AUTO_LENS_SELECTION -> engine.autoLensSelectionChanged()
+            SettingKey.ZOOM_TRANSITION_ANIMATION -> engine.zoomTransitionAnimChanged()
+            SettingKey.LENS_HANDOFF_SETTING -> engine.lensHandoffSettingChanged()
             else -> if (key.needsRebind) engine.rebind()
         }
     }
