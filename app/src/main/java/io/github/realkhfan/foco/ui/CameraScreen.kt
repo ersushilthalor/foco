@@ -843,7 +843,7 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
                 state.burstActive -> Unit
                 tool != null && state.proBarOpen -> ToolSlider(state, tool, actions, Modifier.padding(bottom = 4.dp))
                 state.zoomChips.size > 1 && !(state.kind == CaptureKind.PHOTO && state.photoMode == PhotoMode.PANORAMA) ->
-                    ZoomChips(state, actions, iconRotation, Modifier.padding(bottom = 34.dp))
+                    ZoomChips(state, actions, iconRotation, Modifier.padding(bottom = 22.dp).scale(0.75f))
             }
         }
         Spacer(Modifier.height(8.dp))
