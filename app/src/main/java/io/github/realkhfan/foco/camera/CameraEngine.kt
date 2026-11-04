@@ -332,6 +332,18 @@ class CameraEngine(
         return true
     }
 
+    /**
+     * CameraX logical zoom still renders through the MAIN PreviewView layer. Only report ULTRAWIDE
+     * when an independent Camera2/standby stream is actually feeding the second TextureView.
+     */
+    private fun previewSourceForLens(lens: LensInfo?): PreviewStreamSource {
+        if (lens?.lensType != LensType.ULTRAWIDE) return PreviewStreamSource.MAIN
+        val standbyOwnsLens = backgroundLensManager.isStandbyReady() &&
+            backgroundLensManager.getStandbyLens()?.id == lens.id
+        return if (isCamera2Active || standbyOwnsLens) PreviewStreamSource.ULTRAWIDE
+        else PreviewStreamSource.MAIN
+    }
+
     private fun onViewfinderFrameAvailable(source: PreviewStreamSource) {
         val now = SystemClock.uptimeMillis()
         val previousFrameAt = if (source == PreviewStreamSource.MAIN) lastUltraWidePreviewFrameAtMs else lastMainPreviewFrameAtMs
@@ -339,7 +351,7 @@ class CameraEngine(
         backgroundLensManager.onPreviewFrameAvailable(source)
 
         val target = targetDiscoveredLens
-        val expectedSource = if (target?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+        val expectedSource = previewSourceForLens(target)
         if (isSwitchingLens.get() && target != null && source == expectedSource) {
             val elapsed = if (lensSwitchRequestedAtMs > 0L) (now - lensSwitchRequestedAtMs).coerceAtLeast(0L) else -1L
             firstTargetFrameArrived = true
@@ -607,7 +619,7 @@ class CameraEngine(
                 override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
                     val lens = targetDiscoveredLens ?: activeDiscoveredLens
                     val isStandbyTexture = backgroundLensManager.getStandbyCaptureSession() != null
-                    val source = if (isStandbyTexture || lens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+                    val source = if (isStandbyTexture) PreviewStreamSource.ULTRAWIDE else previewSourceForLens(lens)
                     onViewfinderFrameAvailable(source)
                 }
             }
@@ -2390,8 +2402,7 @@ class CameraEngine(
     ) {
         if (configuredLens != null) {
             activeDiscoveredLens = configuredLens
-            _activePreviewSource.value = if (configuredLens.lensType == LensType.ULTRAWIDE)
-                PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+            _activePreviewSource.value = previewSourceForLens(configuredLens)
         }
         val nextLens = pendingLensWhileSwitching
         val nextZoom = pendingZoomWhileSwitching
