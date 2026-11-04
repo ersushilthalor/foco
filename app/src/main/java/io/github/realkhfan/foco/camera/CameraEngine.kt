@@ -2042,7 +2042,10 @@ class CameraEngine(
             )
         } else {
             zoomTransitionController.cancelTransition()
-            if (targetLens != null && (targetLens.lensType != currentLens?.lensType || targetLens.physicalCameraId != boundPhysicalId)) {
+            if (targetLens != null && (isSwitchingLens.get() ||
+                targetLens.lensType != currentLens?.lensType ||
+                targetLens.physicalCameraId != boundPhysicalId)
+            ) {
                 selectDiscoveredLens(targetLens, clampedZoom, isContinuous = !fromChip)
             } else {
                 applyZoomInternal(clampedZoom, isContinuous = !fromChip)
@@ -2398,7 +2401,7 @@ class CameraEngine(
         isSwitchingLens.set(false)
 
         val active = activeDiscoveredLens
-        val mismatch = nextLens != null && active != null && (
+        val mismatch = nextLens != null && (active == null ||
             nextLens.id != active.id ||
             nextLens.cameraId != active.cameraId ||
             nextLens.physicalCameraId != active.physicalCameraId ||
