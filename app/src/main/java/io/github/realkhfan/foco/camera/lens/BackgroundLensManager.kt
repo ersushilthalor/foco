@@ -2,8 +2,9 @@ package io.github.realkhfan.foco.camera.lens
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.SurfaceTexture
+import android.graphics.Rect
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
@@ -51,11 +52,25 @@ class BackgroundLensManager(
     @Volatile
     private var standbyCaptureSession: CameraCaptureSession? = null
     @Volatile
-    private var standbySurfaceTexture: SurfaceTexture? = null
-    @Volatile
     private var standbySurface: Surface? = null
     @Volatile
+    private var ownsStandbySurface = false
+    @Volatile
     private var standbyLens: LensInfo? = null
+    @Volatile
+    private var mainLens: LensInfo? = null
+    @Volatile
+    private var latestMainRequest: CaptureRequest? = null
+    @Volatile
+    private var latestMainResult: TotalCaptureResult? = null
+    @Volatile
+    private var currentUiZoom = 1.0f
+    @Volatile
+    private var isUltraWideActive = false
+    @Volatile
+    private var isFrameHandoffActive = false
+    @Volatile
+    private var lastMainSyncAtMs = 0L
 
     private val isPreparingStandby = AtomicBoolean(false)
     private val isStreaming = AtomicBoolean(false)
@@ -66,6 +81,132 @@ class BackgroundLensManager(
 
     fun setBackgroundHandler(handler: Handler) {
         backgroundHandler = handler
+    }
+
+    /** Use the actual Ultra-Wide TextureView surface; this Surface is owned by CameraEngine. */
+    fun setPreviewSurface(surface: Surface?) {
+        if (standbySurface === surface) return
+        val sessionWasActive = standbyCaptureSession != null || standbyCameraDevice != null
+        if (sessionWasActive) release()
+        if (ownsStandbySurface) runCatching { standbySurface?.release() }
+        standbySurface = surface?.takeIf { it.isValid }
+        ownsStandbySurface = false
+        if (surface == null) {
+            _status.value = BackgroundCameraStatus.OFF
+        }
+    }
+
+    /** Called by the actual UW TextureView buffer callback, never by a CaptureResult callback. */
+    fun onPreviewFrameAvailable(source: PreviewStreamSource) {
+        if (source != PreviewStreamSource.ULTRAWIDE || standbyCaptureSession == null) return
+        val firstFrame = !isStreaming.getAndSet(true)
+        if (firstFrame || _status.value != BackgroundCameraStatus.READY_QUIET) {
+            _status.value = BackgroundCameraStatus.READY_QUIET
+            Log.i(TAG, "[STANDBY_READY] cameraId=${standbyCameraDevice?.id} lens=${standbyLens?.displayName} firstTextureFrame=true")
+        }
+    }
+
+    fun syncMainCaptureResult(request: CaptureRequest, result: TotalCaptureResult) {
+        latestMainRequest = request
+        latestMainResult = result
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastMainSyncAtMs < 120L) return
+        lastMainSyncAtMs = now
+        syncStandbyStreamSettings()
+    }
+
+    /** Mirror UI zoom during active UW use or frame handoff; otherwise park UW at the switch-point FOV. */
+    fun updateZoom(uiZoom: Float, handoffActive: Boolean, ultraWideIsActive: Boolean) {
+        currentUiZoom = uiZoom.coerceAtLeast(0.5f)
+        isFrameHandoffActive = handoffActive
+        isUltraWideActive = ultraWideIsActive
+        syncStandbyStreamSettings()
+    }
+
+    fun syncStandbyStreamSettings() {
+        if (!settings.backgroundLensPreparation || standbyCaptureSession == null) return
+        val session = standbyCaptureSession ?: return
+        val camera = standbyCameraDevice ?: return
+        val lens = standbyLens ?: return
+        val builder = standbyRequestBuilder ?: return
+        try {
+            applySynchronizedStandbySettings(builder, lens)
+            session.setRepeatingRequest(builder.build(), null, backgroundHandler ?: mainHandler)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Unable to synchronize standby repeating request", t)
+        }
+    }
+
+    private fun calculateStandbyCropRatio(lens: LensInfo): Float {
+        val mainEq = mainLens?.equivalent35mmFocalMm
+            ?.takeIf { it.isFinite() && it > 0f }
+            ?: CameraOpticalCalibration.DEFAULT_MAIN_EQUIVALENT_FOCAL_MM
+        val uwEq = lens.equivalent35mmFocalMm
+            .takeIf { it.isFinite() && it > 0f }
+            ?: CameraOpticalCalibration.DEFAULT_ULTRAWIDE_EQUIVALENT_FOCAL_MM
+        val zoomOverride = if (isFrameHandoffActive || isUltraWideActive) currentUiZoom else null
+        return if (zoomOverride != null) {
+            CameraOpticalCalibration.calculateRequiredDigitalCrop(
+                uiZoom = zoomOverride,
+                lensBaseRatio = lens.baseZoomRatio,
+                lensType = lens.lensType,
+                uwEquivalentFocalMm = uwEq,
+                mainEquivalentFocalMm = mainEq,
+                switchPointMm = settings.switchPointMm
+            )
+        } else if (lens.lensType == LensType.ULTRAWIDE) {
+            CameraOpticalCalibration.calculateFovMatchedUltraWideCrop(
+                switchPointMm = settings.switchPointMm,
+                mainEquivalentFocalMm = mainEq,
+                uwEquivalentFocalMm = uwEq
+            )
+        } else {
+            CameraOpticalCalibration.calculateMainCropForSwitchPoint(
+                switchPointMm = settings.switchPointMm,
+                mainFocalMm = mainEq
+            )
+        }
+    }
+
+    private fun applySynchronizedStandbySettings(builder: CaptureRequest.Builder, lens: LensInfo) {
+        val mainRequest = latestMainRequest
+        val mainResult = latestMainResult
+
+        // Keep the same control modes and locks on both sensors. Unsupported keys on the
+        // secondary camera are ignored independently instead of aborting the whole request.
+        runCatching { mainRequest?.get(CaptureRequest.CONTROL_AE_MODE)?.let { builder.set(CaptureRequest.CONTROL_AE_MODE, it) } }
+        runCatching { mainRequest?.get(CaptureRequest.CONTROL_AWB_MODE)?.let { builder.set(CaptureRequest.CONTROL_AWB_MODE, it) } }
+        runCatching { mainRequest?.get(CaptureRequest.CONTROL_AF_MODE)?.let { builder.set(CaptureRequest.CONTROL_AF_MODE, it) } }
+        runCatching { mainRequest?.get(CaptureRequest.CONTROL_AE_LOCK)?.let { builder.set(CaptureRequest.CONTROL_AE_LOCK, it) } }
+        runCatching { mainRequest?.get(CaptureRequest.CONTROL_AWB_LOCK)?.let { builder.set(CaptureRequest.CONTROL_AWB_LOCK, it) } }
+        runCatching { mainRequest?.get(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION)?.let { builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, it) } }
+        runCatching { mainRequest?.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) } }
+
+        val aeMode = mainRequest?.get(CaptureRequest.CONTROL_AE_MODE)
+        if (aeMode == CameraMetadata.CONTROL_AE_MODE_OFF) {
+            runCatching { mainResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it) } }
+            runCatching { mainResult?.get(CaptureResult.SENSOR_SENSITIVITY)?.let { builder.set(CaptureRequest.SENSOR_SENSITIVITY, it) } }
+        }
+
+        val characteristics = try { cameraManager?.getCameraCharacteristics(lens.cameraId) } catch (_: Throwable) { null }
+        val activeArray = characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        if (characteristics != null && activeArray != null) {
+            val ratio = calculateStandbyCropRatio(lens).coerceAtLeast(1.0f)
+            val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            } else null
+            if (zoomRange != null) {
+                // API 30+: set the zoom ratio and the full active-array crop together.
+                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, ratio.coerceIn(zoomRange.lower, zoomRange.upper))
+                builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(activeArray))
+            } else {
+                val cropWidth = (activeArray.width() / ratio).toInt().coerceIn(1, activeArray.width())
+                val cropHeight = (activeArray.height() / ratio).toInt().coerceIn(1, activeArray.height())
+                val left = activeArray.left + (activeArray.width() - cropWidth) / 2
+                val top = activeArray.top + (activeArray.height() - cropHeight) / 2
+                builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropWidth, top + cropHeight))
+            }
+        }
     }
 
     fun isStandbyReady(): Boolean {
@@ -114,6 +255,13 @@ class BackgroundLensManager(
             return
         }
         if (secondaryLens == null || cameraManager == null) return
+        this.mainLens = mainLens
+        val preview = standbySurface
+        if (preview == null || !preview.isValid) {
+            _status.value = BackgroundCameraStatus.PREPARING
+            Log.i(TAG, "[STANDBY_READY] waiting for the real Ultra-Wide TextureView surface")
+            return
+        }
 
         val dualMode = detectSimultaneousStreamingMode(mainLens, secondaryLens)
         Log.i(TAG, "[BACKGROUND_LENS] Preparing secondary lens ${secondaryLens.displayName} via dualMode=$dualMode")
@@ -124,11 +272,11 @@ class BackgroundLensManager(
             return
         }
 
-        // If logical multi-camera with physical stream, the active logical device already has access
+        // CameraX owns the main logical device. Opening a second Camera2 device with the same
+        // logical camera ID is not a real standby stream; never report it as ready without frames.
         if (dualMode == DualStreamingMode.LOGICAL_MULTI_CAMERA_PHYSICAL && mainLens?.cameraId == secondaryLens.cameraId) {
-            _status.value = BackgroundCameraStatus.READY_QUIET
-            isStreaming.set(true)
-            standbyLens = secondaryLens
+            _status.value = BackgroundCameraStatus.UNAVAILABLE
+            Log.w(TAG, "[STANDBY_READY] logical physical stream needs a Camera2 main session; sequential fallback required")
             return
         }
 
@@ -148,13 +296,11 @@ class BackgroundLensManager(
         val openToken = standbyDeviceGen.incrementAndGet()
 
         try {
-            val texture = standbySurfaceTexture ?: SurfaceTexture(0).also {
-                it.setDefaultBufferSize(max(targetSize.width, targetSize.height), min(targetSize.width, targetSize.height))
-                standbySurfaceTexture = it
-            }
-            if (standbySurface == null || !standbySurface!!.isValid) {
-                standbySurface?.release()
-                standbySurface = Surface(texture)
+            val surface = standbySurface?.takeIf { it.isValid } ?: run {
+                isPreparingStandby.set(false)
+                _status.value = BackgroundCameraStatus.UNAVAILABLE
+                Log.w(TAG, "Standby surface is unavailable; refusing dummy-surface fallback")
+                return
             }
 
             cameraManager.openCamera(secondaryLens.cameraId, object : CameraDevice.StateCallback() {
@@ -199,8 +345,9 @@ class BackgroundLensManager(
     }
 
     private fun configureStandbySession(camera: CameraDevice, lens: LensInfo) {
-        val surf = standbySurface ?: run {
+        val surf = standbySurface?.takeIf { it.isValid } ?: run {
             isPreparingStandby.set(false)
+            _status.value = BackgroundCameraStatus.UNAVAILABLE
             return
         }
         val configToken = standbySessionGen.incrementAndGet()
@@ -211,7 +358,7 @@ class BackgroundLensManager(
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-            }
+            }.also { applySynchronizedStandbySettings(it, lens) }
 
             @Suppress("DEPRECATION")
             camera.createCaptureSession(listOf(surf), object : CameraCaptureSession.StateCallback() {
@@ -229,12 +376,8 @@ class BackgroundLensManager(
                     try {
                         session.setRepeatingRequest(requestBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
                             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                                val firstFrame = !isStreaming.getAndSet(true)
-                                if (firstFrame || _status.value != BackgroundCameraStatus.READY_QUIET) {
-                                    _status.value = BackgroundCameraStatus.READY_QUIET
-                                    Log.i(TAG, "[BACKGROUND_LENS] First valid target preview frame arrived on standby camera ${camera.id} (${lens.displayName})")
-                                    onFrameAvailable?.invoke(PreviewStreamSource.ULTRAWIDE)
-                                }
+                                // CaptureResult confirms the repeating request is running. The
+                                // actual ready signal is TextureView.onSurfaceTextureUpdated().
                             }
                         }, backgroundHandler ?: mainHandler)
                         Log.i(TAG, "[BACKGROUND_LENS] Standby session configured on camera ID ${camera.id} (${lens.displayName}). Awaiting preview frames...")
@@ -279,11 +422,11 @@ class BackgroundLensManager(
         try { standbyCameraDevice?.close() } catch (_: Throwable) {}
         standbyCameraDevice = null
 
-        try { standbySurface?.release() } catch (_: Throwable) {}
-        standbySurface = null
-
-        try { standbySurfaceTexture?.release() } catch (_: Throwable) {}
-        standbySurfaceTexture = null
+        if (ownsStandbySurface) {
+            try { standbySurface?.release() } catch (_: Throwable) {}
+            standbySurface = null
+            ownsStandbySurface = false
+        }
 
         standbyLens = null
     }
