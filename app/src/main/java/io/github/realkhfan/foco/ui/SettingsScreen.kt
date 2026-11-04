@@ -125,6 +125,22 @@ fun SettingsScreen(state: AppState, settings: AppSettings, actions: CameraAction
                     actions.settingChanged(SettingKey.LENS_HANDOFF_SETTING)
                 }
             }
+            item {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            state.lensDebugDialogText = io.github.realkhfan.foco.camera.lens.LensDebugLog.dump()
+                        }
+                        .padding(horizontal = 24.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Lens debug log", color = Color.White, fontSize = 16.sp)
+                        Text("View timeline of 0.5x requests, camera lifecycle, and stream stages", color = FocoColors.Dim, fontSize = 12.sp)
+                    }
+                }
+            }
             item { Section("Camera") }
             item {
                 SwitchRow("Show quick access controls", "One-tap buttons for flash, timer and ratio at the top", settings.quickAccess) {

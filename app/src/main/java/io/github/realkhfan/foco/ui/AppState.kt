@@ -184,6 +184,7 @@ class AppState {
     var qrText by mutableStateOf<String?>(null)
     var message by mutableStateOf<String?>(null)
     var review by mutableStateOf<Review?>(null)
+    var lensDebugDialogText by mutableStateOf<String?>(null)
 }
 
 /** Night will be used for the next photo (Night mode, or "More light: Night auto" in the dark). */

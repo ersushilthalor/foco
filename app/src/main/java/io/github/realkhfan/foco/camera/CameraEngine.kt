@@ -52,6 +52,7 @@ import androidx.camera.core.DynamicRange
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
+import androidx.camera.core.CameraState
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.MirrorMode
@@ -59,14 +60,19 @@ import io.github.realkhfan.foco.camera.lens.BackgroundLensManager
 import io.github.realkhfan.foco.camera.lens.CameraDiscovery
 import io.github.realkhfan.foco.camera.lens.CameraInventory
 import io.github.realkhfan.foco.camera.lens.CameraOpticalCalibration
+import io.github.realkhfan.foco.camera.lens.LensDebugLog
 import io.github.realkhfan.foco.camera.lens.LensInfo
 import io.github.realkhfan.foco.camera.lens.LensSwitchStrategy
 import io.github.realkhfan.foco.camera.lens.LensType
 import io.github.realkhfan.foco.camera.lens.PreviewStreamSource
 import io.github.realkhfan.foco.camera.lens.ZoomTransitionController
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCase
 import androidx.camera.core.ZoomState
@@ -121,7 +127,6 @@ import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.roundToInt
-import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
  * Owns CameraX: binds the right use cases for the current mode, probes what the phone allows,
@@ -248,19 +253,33 @@ class CameraEngine(
     private var camera2PendingStillFile: File? = null
     private var camera2ComboStage = 1
     private var camera2PreviewSize: Size = Size(1440, 1080)
+    private var camera2CloseDeferred: CompletableDeferred<Unit>? = null
+
+    private enum class Camera2WatchdogStage {
+        OPEN,
+        CONFIGURE,
+        FIRST_FRAME
+    }
+    private var camera2WatchdogStage = Camera2WatchdogStage.OPEN
     private var camera2WatchdogRunnable: Runnable? = null
 
-    private fun startCamera2Watchdog() {
+    private fun startCamera2Watchdog(stage: Camera2WatchdogStage, timeoutMs: Long) {
         cancelCamera2Watchdog()
+        camera2WatchdogStage = stage
         val r = Runnable {
             if (isCamera2Active && !firstTargetFrameArrived) {
-                Log.w(TAG, "[CAMERA2_TIMEOUT] No frame arrived within 2.2s on Camera2, falling back to 1x Main")
-                Log.w("LensDiag", "[0.5x TIMEOUT] No preview frame arrived within 2.2s on Camera2 ID ${camera2Device?.id}, falling back to 1x")
-                fallbackToCameraXMain("Ultra-wide preview timed out, returned to 1x")
+                val stageName = when (stage) {
+                    Camera2WatchdogStage.OPEN -> "open"
+                    Camera2WatchdogStage.CONFIGURE -> "configure (combo $camera2ComboStage)"
+                    Camera2WatchdogStage.FIRST_FRAME -> "first frame"
+                }
+                LensDebugLog.log("watchdog fired: stage $stageName timed out after ${timeoutMs}ms")
+                Log.w(TAG, "[CAMERA2_TIMEOUT] Watchdog fired: stage $stageName timed out after ${timeoutMs}ms on Camera2 ID ${camera2Device?.id}")
+                fallbackToCameraXMain("Ultra-wide preview timed out ($stageName), returned to 1x")
             }
         }
         camera2WatchdogRunnable = r
-        mainHandler.postDelayed(r, 2200L)
+        mainHandler.postDelayed(r, timeoutMs)
     }
 
     private fun cancelCamera2Watchdog() {
@@ -272,6 +291,7 @@ class CameraEngine(
 
     private fun fallbackToCameraXMain(msg: String) {
         mainHandler.post {
+            LensDebugLog.log("fallbackToCameraXMain: $msg")
             cancelCamera2Watchdog()
             closeCamera2(keepTexture = false)
             isSwitchingLens.set(false)
@@ -286,9 +306,33 @@ class CameraEngine(
             desiredZoom = 1.0f
             zoomFactor = 1.0f
             state.message = msg
+            state.lensDebugDialogText = LensDebugLog.dump()
             Log.w(TAG, "[CAMERA2_FALLBACK] Restoring Main lens via CameraX: ${mainLens?.displayName} ($msg)")
-            Log.w("LensDiag", "[0.5x FALLBACK] Restoring Main lens via CameraX: ${mainLens?.displayName}")
             rebind()
+        }
+    }
+
+    fun onHostStop() {
+        if (isCamera2Active) {
+            LensDebugLog.log("onHostStop: closing Camera2 while preserving active lens")
+            closeCamera2(keepTexture = false)
+        }
+    }
+
+    fun onHostStart() {
+        val currentTarget = targetDiscoveredLens ?: activeDiscoveredLens
+        val requestedBack = state.lensFacing == CameraSelector.LENS_FACING_BACK
+        val activeRequiresCamera2 = requestedBack && currentTarget != null && (
+            currentTarget.isHiddenAux ||
+            (currentTarget.isIndependentCamera && currentTarget.cameraId != "0" && currentTarget.cameraId != "1") ||
+            (currentTarget.lensType == LensType.ULTRAWIDE && currentTarget.cameraId != "0")
+        )
+        if (activeRequiresCamera2 && !isCamera2Active) {
+            LensDebugLog.log("onHostStart: re-opening Camera2 for ${currentTarget.displayName}")
+            isSwitchingLens.set(true)
+            targetDiscoveredLens = currentTarget
+            firstTargetFrameArrived = false
+            openCamera2(currentTarget)
         }
     }
 
@@ -327,6 +371,7 @@ class CameraEngine(
             visibility = android.view.View.GONE
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                    LensDebugLog.log("TextureView available: ${width}x${height}")
                     camera2Surface?.release()
                     camera2Surface = Surface(st)
                     st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
@@ -337,29 +382,32 @@ class CameraEngine(
                 }
 
                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-                    camera2Surface?.release()
-                    camera2Surface = Surface(st)
+                    LensDebugLog.log("TextureView size changed: ${width}x${height}")
                     st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
                     updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
                 }
 
                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    LensDebugLog.log("TextureView destroyed")
                     camera2Surface?.release()
                     camera2Surface = null
                     return true
                 }
 
                 override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                    if (!firstTargetFrameArrived) {
+                        firstTargetFrameArrived = true
+                        cancelCamera2Watchdog()
+                        LensDebugLog.log("first onSurfaceTextureUpdated arrived (watchdog cancelled)")
+                    }
                     if (isSwitchingLens.get()) {
                         val target = targetDiscoveredLens
                         if (target != null) {
-                            firstTargetFrameArrived = true
-                            cancelCamera2Watchdog()
                             activeDiscoveredLens = target
                             targetDiscoveredLens = null
                             Log.i(TAG, "[CAMERA2_LENS_FRAME] First valid target preview frame arrived on Camera2 ID ${camera2Device?.id} (${target.displayName})")
                             Log.i(TAG, "[LENS_SWITCH_SUCCESS] Switching successfully completed to ${target.displayName} at zoom ${state.zoom}")
-                            Log.i("LensDiag", "[0.5x ACTIVE] First preview frame received, lens ${target.displayName} active")
+                            LensDebugLog.log("lens switch completed to ${target.displayName}")
                         }
                         isSwitchingLens.set(false)
                     }
@@ -377,8 +425,11 @@ class CameraEngine(
         val mgr = cameraManager ?: run {
             isSwitchingLens.set(false)
             state.message = "CameraManager not available"
+            LensDebugLog.log("openCamera2 failed: CameraManager not available")
             return
         }
+
+        LensDebugLog.log("openCamera2 called for ${lens.displayName} (cameraId=${lens.cameraId}, surface=${if (camera2Surface != null) "ready" else "null"})")
 
         // Release standby camera before opening Camera2 to avoid hardware concurrency limits
         backgroundLensManager.release()
@@ -386,7 +437,7 @@ class CameraEngine(
 
         isCamera2Active = true
         firstTargetFrameArrived = false
-        startCamera2Watchdog()
+        startCamera2Watchdog(Camera2WatchdogStage.OPEN, 4000L)
 
         mainHandler.post {
             camera2TextureView?.visibility = android.view.View.VISIBLE
@@ -394,11 +445,11 @@ class CameraEngine(
 
         val openToken = camera2DeviceGen.incrementAndGet()
         Log.i(TAG, "[CAMERA2_OPEN] Opening Camera2 device ID ${lens.cameraId} (${lens.displayName}, isHiddenAux=${lens.isHiddenAux})")
-        Log.i("LensDiag", "[0.5x OPEN] Opening Camera2 device ID ${lens.cameraId} (${lens.displayName})")
 
         try {
             mgr.openCamera(lens.cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
+                    LensDebugLog.log("CameraDevice onOpened (ID ${device.id})")
                     if (openToken != camera2DeviceGen.get() || !isCamera2Active) {
                         try { device.close() } catch (_: Throwable) {}
                         return
@@ -407,13 +458,12 @@ class CameraEngine(
                     boundCameraId = device.id
                     boundPhysicalId = lens.physicalCameraId
                     Log.i(TAG, "[CAMERA2_OPENED] Camera2 device ID ${device.id} opened successfully")
-                    Log.i("LensDiag", "[0.5x OPENED] Camera2 device ID ${device.id} opened successfully")
                     createCamera2Session(comboStage = 1)
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
+                    LensDebugLog.log("CameraDevice onDisconnected (ID ${device.id})")
                     Log.w(TAG, "[CAMERA2_DISCONNECTED] Camera2 device ID ${device.id} disconnected")
-                    Log.w("LensDiag", "[0.5x DISCONNECTED] Camera2 device ID ${device.id} disconnected")
                     if (camera2Device == device) {
                         fallbackToCameraXMain("Ultra-wide camera disconnected, returned to 1x")
                     }
@@ -428,26 +478,38 @@ class CameraEngine(
                         CameraDevice.StateCallback.ERROR_CAMERA_SERVICE -> "CAMERA_SERVICE"
                         else -> "error code $error"
                     }
+                    LensDebugLog.log("CameraDevice onError (ID ${device.id}, error=$errDesc)")
                     Log.e(TAG, "[CAMERA2_ERROR] Camera2 device ${device.id} error: $errDesc")
-                    Log.e("LensDiag", "[0.5x ERROR] Camera2 device ${device.id} error: $errDesc")
                     if (camera2Device == device || camera2Device == null) {
                         fallbackToCameraXMain("Failed to open ${lens.displayName} ($errDesc), returned to 1x")
                     }
                 }
+
+                override fun onClosed(device: CameraDevice) {
+                    LensDebugLog.log("CameraDevice onClosed (ID ${device.id})")
+                    camera2CloseDeferred?.complete(Unit)
+                }
             }, camera2Handler)
         } catch (t: Throwable) {
+            LensDebugLog.log("openCamera2 exception: ${t.message}")
             Log.e(TAG, "[CAMERA2_ERROR] Exception opening Camera2 device ${lens.cameraId}", t)
-            Log.e("LensDiag", "[0.5x ERROR] Exception opening Camera2 device ${lens.cameraId}: ${t.message}")
             fallbackToCameraXMain("Failed to open ${lens.displayName}: ${t.message}, returned to 1x")
         }
     }
 
     private fun createCamera2Session(comboStage: Int = 1) {
         val device = camera2Device ?: return
-        val surf = camera2Surface ?: return
+        val surf = camera2Surface
         val lens = targetDiscoveredLens ?: activeDiscoveredLens ?: return
         val configToken = camera2SessionGen.incrementAndGet()
         camera2ComboStage = comboStage
+
+        LensDebugLog.log("createCamera2Session: comboStage=$comboStage, camera2Surface=${if (surf != null) "valid" else "null"}")
+
+        if (surf == null) {
+            LensDebugLog.log("createCamera2Session postponed: camera2Surface is null, waiting for TextureView")
+            return
+        }
 
         camera2JpegReader?.close()
         camera2JpegReader = null
@@ -530,8 +592,9 @@ class CameraEngine(
             }
         }
 
-        Log.i("LensDiag", "[0.5x REQUEST] Lens: ${lens.displayName}, Strategy: Camera2 (ID ${device.id}), Attempting stream combo $comboStage: $comboDesc")
+        LensDebugLog.log("createCamera2Session: Attempting stream combo $comboStage: $comboDesc")
         Log.i(TAG, "[CAMERA2] Configuring session with $comboDesc on camera ${device.id}")
+        startCamera2Watchdog(Camera2WatchdogStage.CONFIGURE, 3000L)
 
         try {
             val reqBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -550,10 +613,11 @@ class CameraEngine(
                         return
                     }
                     camera2Session = session
+                    LensDebugLog.log("CameraCaptureSession onConfigured (combo $comboStage: $comboDesc)")
                     Log.i(TAG, "[CAMERA2_SESSION] Camera2 session configured with combo $comboStage: $comboDesc")
-                    Log.i("LensDiag", "[0.5x SUCCESS] Stream combo $comboStage configured successfully on Camera2 ID ${device.id} ($comboDesc)")
                     applyCamera2Pro(reqBuilder)
                     applyCamera2Zoom(desiredZoom, reqBuilder)
+                    startCamera2Watchdog(Camera2WatchdogStage.FIRST_FRAME, 3000L)
 
                     try {
                         session.setRepeatingRequest(reqBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
@@ -570,16 +634,19 @@ class CameraEngine(
                                     meteredIso = iso
                                 }
 
+                                if (!firstTargetFrameArrived) {
+                                    firstTargetFrameArrived = true
+                                    cancelCamera2Watchdog()
+                                    LensDebugLog.log("first CaptureResult arrived (watchdog cancelled)")
+                                }
                                 if (isSwitchingLens.get()) {
                                     val target = targetDiscoveredLens
                                     if (target != null) {
-                                        firstTargetFrameArrived = true
-                                        cancelCamera2Watchdog()
                                         activeDiscoveredLens = target
                                         targetDiscoveredLens = null
                                         Log.i(TAG, "[CAMERA2_LENS_FRAME] First valid preview frame arrived on Camera2 ID ${device.id} (${target.displayName})")
                                         Log.i(TAG, "[LENS_SWITCH_SUCCESS] Switching successfully completed to ${target.displayName}")
-                                        Log.i("LensDiag", "[0.5x ACTIVE] First preview frame received, lens ${target.displayName} active")
+                                        LensDebugLog.log("lens switch completed to ${target.displayName}")
                                     }
                                     isSwitchingLens.set(false)
                                 }
@@ -610,6 +677,7 @@ class CameraEngine(
                             }
                         }, camera2Handler)
                     } catch (e: Exception) {
+                        LensDebugLog.log("setRepeatingRequest error: ${e.message}")
                         Log.e(TAG, "[CAMERA2_SESSION_ERROR] Failed setRepeatingRequest on ${device.id}", e)
                     }
 
@@ -619,8 +687,8 @@ class CameraEngine(
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
+                    LensDebugLog.log("CameraCaptureSession onConfigureFailed (combo $comboStage on Camera2 ID ${device.id})")
                     Log.w(TAG, "[CAMERA2_SESSION_ERROR] Stream combination failed for $comboDesc on ${device.id}")
-                    Log.w("LensDiag", "[0.5x RETRY] Stream combo $comboStage onConfigureFailed on Camera2 ID ${device.id}")
                     if (configToken != camera2SessionGen.get()) return
 
                     if (comboStage < 3) {
@@ -628,8 +696,8 @@ class CameraEngine(
                         Log.i(TAG, "[CAMERA2] Retrying with progressive smaller stream combo: stage $nextStage")
                         createCamera2Session(nextStage)
                     } else {
+                        LensDebugLog.log("All 3 stream combinations failed on Camera2 ID ${device.id}")
                         Log.e(TAG, "[CAMERA2_SESSION_ERROR] All 3 stream combinations failed on Camera2 ID ${device.id}")
-                        Log.e("LensDiag", "[0.5x FAILED] All stream combos failed on Camera2 ID ${device.id}, falling back to 1x")
                         fallbackToCameraXMain("Ultra-wide session configuration failed, returned to 1x")
                     }
                 }
@@ -641,6 +709,7 @@ class CameraEngine(
                 }
             }, camera2Handler)
         } catch (e: Exception) {
+            LensDebugLog.log("createCaptureSession exception: ${e.message}")
             Log.e(TAG, "[CAMERA2_SESSION_ERROR] Exception creating capture session for $comboDesc on ${device.id}", e)
             if (comboStage < 3) {
                 createCamera2Session(comboStage + 1)
@@ -658,8 +727,14 @@ class CameraEngine(
         try { camera2Session?.close() } catch (_: Throwable) {}
         camera2Session = null
 
-        try { camera2Device?.close() } catch (_: Throwable) {}
-        camera2Device = null
+        val dev = camera2Device
+        if (dev != null) {
+            camera2CloseDeferred = CompletableDeferred()
+            try { dev.close() } catch (_: Throwable) {}
+            camera2Device = null
+        } else {
+            camera2CloseDeferred?.complete(Unit)
+        }
 
         camera2JpegReader?.close()
         camera2JpegReader = null
@@ -1075,6 +1150,10 @@ class CameraEngine(
 
         if (activeRequiresCamera2) {
             Log.i(TAG, "[LENS_SWITCH_REBIND] Target lens ${currentTarget.displayName} requires Camera2. Preserving/re-opening Camera2 instead of CameraX.")
+            LensDebugLog.log("rebind(): re-opening Camera2 for ${currentTarget.displayName}")
+            isSwitchingLens.set(true)
+            targetDiscoveredLens = currentTarget
+            firstTargetFrameArrived = false
             camera?.cameraInfo?.zoomState?.removeObserver(zoomObserver)
             provider.unbindAll()
             camera = null
@@ -1650,6 +1729,9 @@ class CameraEngine(
 
     /** @param zoom zoom as shown to the user (0.5 = ultrawide). Chip taps glide smoothly with ported zoom transition algorithms. */
     fun setZoom(zoom: Float, fromChip: Boolean) {
+        if (zoom < 0.95f || fromChip) {
+            LensDebugLog.log("chip tap / setZoom args: zoom=$zoom, fromChip=$fromChip")
+        }
         desiredZoom = zoom
         val isFront = state.lensFacing == CameraSelector.LENS_FACING_FRONT
         val backLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
@@ -1741,6 +1823,10 @@ class CameraEngine(
     }
 
     fun selectDiscoveredLens(lens: LensInfo, targetZoom: Float, isContinuous: Boolean) {
+        if (isSwitchingLens.get() && targetDiscoveredLens?.id == lens.id) {
+            LensDebugLog.log("selectDiscoveredLens ignored: switch to ${lens.displayName} (id=${lens.id}) already in flight")
+            return
+        }
         desiredZoom = targetZoom
         val currentLens = activeDiscoveredLens
         val isDifferentLens = (currentLens == null) ||
@@ -1748,6 +1834,10 @@ class CameraEngine(
             (currentLens.lensType != lens.lensType) ||
             (lens.physicalCameraId != boundPhysicalId) ||
             (lens.isIndependentCamera && lens.cameraId != boundCameraId)
+
+        val officialIds = try { cameraManager?.cameraIdList?.toSet() ?: emptySet() } catch (_: Throwable) { emptySet() }
+        val inOfficial = lens.cameraId in officialIds
+        LensDebugLog.log("selectDiscoveredLens: ${lens.displayName} (camId=${lens.cameraId}, physId=${lens.physicalCameraId}, type=${lens.lensType}, isHidden=${lens.isHiddenAux}, isIndep=${lens.isIndependentCamera}, inOfficialList=$inOfficial, targetZoom=$targetZoom)")
 
         if (lens.lensType == LensType.ULTRAWIDE || targetZoom < 0.95f) {
             val chars = try { cameraManager?.getCameraCharacteristics(lens.cameraId) } catch (_: Throwable) { null }
@@ -1775,6 +1865,10 @@ class CameraEngine(
     }
 
     fun switchCameraToLens(targetLens: LensInfo, targetZoom: Float) {
+        if (isSwitchingLens.get() && targetDiscoveredLens?.id == targetLens.id) {
+            LensDebugLog.log("switchCameraToLens ignored: switch to ${targetLens.displayName} (id=${targetLens.id}) already in flight")
+            return
+        }
         val currentLens = activeDiscoveredLens
         val strategy = CameraDiscovery.resolveSwitchStrategy(currentLens, targetLens)
         targetDiscoveredLens = targetLens
@@ -1782,6 +1876,10 @@ class CameraEngine(
         isSwitchingLens.set(true)
         firstTargetFrameArrived = false
         val switchGen = lensSwitchGeneration.incrementAndGet()
+
+        val officialIds = try { cameraManager?.cameraIdList?.toSet() ?: emptySet() } catch (_: Throwable) { emptySet() }
+        val inOfficial = targetLens.cameraId in officialIds
+        LensDebugLog.log("switchCameraToLens: ${targetLens.displayName} (camId=${targetLens.cameraId}, physId=${targetLens.physicalCameraId}, type=${targetLens.lensType}, isHidden=${targetLens.isHiddenAux}, isIndep=${targetLens.isIndependentCamera}, inOfficialList=$inOfficial, targetZoom=$targetZoom)")
 
         Log.i(
             TAG,
@@ -1807,23 +1905,80 @@ class CameraEngine(
         // Use Camera2 API directly!
         if (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0")) {
             Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
-            camera?.cameraInfo?.zoomState?.removeObserver(zoomObserver)
-            provider?.unbindAll()
-            camera = null
-            imageCapture = null
-            videoCapture = null
-            analysis = null
-            state.cameraReady = false
+            val cam = camera
+            if (cam != null) {
+                val closedDeferred = CompletableDeferred<Unit>()
+                val observer = object : Observer<CameraState> {
+                    override fun onChanged(state: CameraState) {
+                        if (state.type == CameraState.Type.CLOSED) {
+                            cam.cameraInfo.cameraState.removeObserver(this)
+                            closedDeferred.complete(Unit)
+                        }
+                    }
+                }
+                cam.cameraInfo.cameraState.observeForever(observer)
+                cam.cameraInfo.zoomState.removeObserver(zoomObserver)
+                LensDebugLog.log("unbindAll called")
+                provider?.unbindAll()
+                camera = null
+                imageCapture = null
+                videoCapture = null
+                analysis = null
+                state.cameraReady = false
 
-            zoomFactor = targetLens.baseZoomRatio
-            openCamera2(targetLens)
-            return
+                engineScope.launch {
+                    val result = withTimeoutOrNull(1500L) {
+                        closedDeferred.await()
+                    }
+                    mainHandler.post {
+                        cam.cameraInfo.cameraState.removeObserver(observer)
+                        if (result != null) {
+                            LensDebugLog.log("CameraX camera state CLOSED reached")
+                        } else {
+                            LensDebugLog.log("CameraX camera state wait timed out after 1.5s, proceeding with openCamera2")
+                        }
+                        zoomFactor = targetLens.baseZoomRatio
+                        openCamera2(targetLens)
+                    }
+                }
+                return
+            } else {
+                LensDebugLog.log("unbindAll called (no active camera)")
+                provider?.unbindAll()
+                zoomFactor = targetLens.baseZoomRatio
+                openCamera2(targetLens)
+                return
+            }
         }
 
         // Otherwise, if switching back from Camera2 to CameraX (e.g. 0.5x -> 1x Main):
         if (isCamera2Active) {
             Log.i(TAG, "[LENS_SWITCH_CAMX] Closing Camera2 and returning to CameraX for ${targetLens.displayName}")
+            LensDebugLog.log("Closing Camera2 before returning to CameraX for ${targetLens.displayName}")
             closeCamera2(keepTexture = false)
+            val deferred = camera2CloseDeferred
+            if (deferred != null && !deferred.isCompleted) {
+                engineScope.launch {
+                    val result = withTimeoutOrNull(1500L) {
+                        deferred.await()
+                    }
+                    mainHandler.post {
+                        if (result != null) {
+                            LensDebugLog.log("Camera2 device CLOSED reached")
+                        } else {
+                            LensDebugLog.log("Camera2 device wait timed out after 1.5s, proceeding with rebind")
+                        }
+                        if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
+                            Log.i(TAG, "[LENS_SWITCH] Background lens is READY for ${targetLens.displayName}")
+                        }
+                        if (settings.manualLens) {
+                            state.manualLensId = targetLens.physicalCameraId ?: targetLens.cameraId
+                        }
+                        rebind()
+                    }
+                }
+                return
+            }
         }
 
         if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {

@@ -38,6 +38,7 @@ import io.github.realkhfan.foco.ui.AppState
 import io.github.realkhfan.foco.ui.CameraScreen
 import io.github.realkhfan.foco.ui.CaptureKind
 import io.github.realkhfan.foco.ui.IntentMode
+import io.github.realkhfan.foco.ui.LensDebugDialog
 import io.github.realkhfan.foco.ui.MessageToast
 import io.github.realkhfan.foco.ui.PermissionScreen
 import io.github.realkhfan.foco.ui.SettingsScreen
@@ -231,6 +232,9 @@ open class MainActivity : ComponentActivity() {
         state.viewerItems?.let { ViewerScreen(it, state.secure, coordinator) }
         if (state.fullSettingsOpen) SettingsScreen(state, settings, coordinator)
         if (state.viewerItems != null || state.fullSettingsOpen) MessageToast(state)
+        state.lensDebugDialogText?.let { text ->
+            LensDebugDialog(text = text, onDismiss = { state.lensDebugDialogText = null })
+        }
     }
 
     private fun startCamera() {
@@ -249,6 +253,7 @@ open class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        engine.onHostStart()
         runCatching {
             contentResolver.registerContentObserver(
                 MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL), true, mediaObserver,
@@ -274,6 +279,7 @@ open class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        engine.onHostStop()
         runCatching { contentResolver.unregisterContentObserver(mediaObserver) }
         orientation.stop()
         location.stop()
