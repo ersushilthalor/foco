@@ -274,12 +274,9 @@ class CameraEngine(
                 }
                 val observer = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
                     override fun onGlobalLayout() {
-                        if (attachCameraXFrameListener()) {
-                            cameraXPreviewLayoutListener = null
-                            if (value.viewTreeObserver.isAlive) {
-                                value.viewTreeObserver.removeOnGlobalLayoutListener(this)
-                            }
-                        }
+                        // PreviewView may replace its internal TextureView during a use-case rebind.
+                        // Keep observing layouts so the replacement renderer gets wrapped as well.
+                        attachCameraXFrameListener()
                     }
                 }
                 cameraXPreviewLayoutListener = observer
@@ -1341,6 +1338,13 @@ class CameraEngine(
     }
 
     fun release() {
+        cameraXPreviewLayoutListener?.let { listener ->
+            previewView?.viewTreeObserver?.takeIf { it.isAlive }?.removeOnGlobalLayoutListener(listener)
+        }
+        cameraXPreviewLayoutListener = null
+        cameraXPreviewTextureView = null
+        cameraXPreviewOriginalListener = null
+        cameraXPreviewWrappedListener = null
         closeCamera2()
         camera2Surface?.release()
         camera2Surface = null
