@@ -12,6 +12,7 @@ import android.provider.MediaStore
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -212,10 +213,27 @@ open class MainActivity : ComponentActivity() {
         CameraScreen(state, settings, coordinator) { modifier ->
             AndroidView(
                 factory = { context ->
-                    PreviewView(context).apply {
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
-                        implementationMode = PreviewView.ImplementationMode.PERFORMANCE
-                        engine.previewView = this
+                    // Keep CameraX PreviewView and the hidden-lens Camera2 TextureView as siblings.
+                    // PreviewView owns its internal children and may recreate them during use-case binding;
+                    // embedding our TextureView inside it lets that lifecycle destroy the Camera2 SurfaceTexture.
+                    FrameLayout(context).apply {
+                        clipChildren = true
+                        clipToPadding = true
+
+                        val cameraXPreview = PreviewView(context).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+                        }
+                        addView(
+                            cameraXPreview,
+                            FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT
+                            )
+                        )
+
+                        engine.camera2PreviewHost = this
+                        engine.previewView = cameraXPreview
                     }
                 },
                 modifier = modifier,
