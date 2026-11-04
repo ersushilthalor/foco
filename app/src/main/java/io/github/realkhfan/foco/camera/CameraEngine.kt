@@ -1587,12 +1587,8 @@ class CameraEngine(
             LensDebugLog.log("CameraX rebind complete: active=${newlyBoundLens?.displayName}, cameraId=$boundCameraId, zoom=${state.zoom}")
         }
 
-        if (settings.backgroundLensPreparation && currentFacing == CameraSelector.LENS_FACING_BACK) {
-            val mainLens = matchingLenses.firstOrNull { it.isPrimaryMain } ?: matchingLenses.firstOrNull { it.lensType == LensType.WIDE }
-            val secondaryLens = if ((targetLens ?: activeDiscoveredLens)?.lensType == LensType.ULTRAWIDE) mainLens
-                else matchingLenses.firstOrNull { it.lensType == LensType.ULTRAWIDE }
-                    ?: matchingLenses.firstOrNull { it.lensType == LensType.TELEPHOTO || it.lensType == LensType.TELEPHOTO_3X }
-            backgroundLensManager.prepareSecondaryLens(mainLens, secondaryLens)
+        if (currentFacing == CameraSelector.LENS_FACING_BACK) {
+            backgroundLensPrepChanged()
         }
     }
 
@@ -2282,19 +2278,38 @@ class CameraEngine(
     }
 
     fun backgroundLensPrepChanged() {
-        if (settings.backgroundLensPreparation && state.lensFacing == CameraSelector.LENS_FACING_BACK) {
-            val backLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
-            val mainLens = backLenses.firstOrNull { it.isPrimaryMain } ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
-            val secondaryLens = backLenses.firstOrNull { it.lensType == LensType.ULTRAWIDE }
-                ?: backLenses.firstOrNull { it.lensType == LensType.TELEPHOTO || it.lensType == LensType.TELEPHOTO_3X }
-            backgroundLensManager.prepareSecondaryLens(mainLens, secondaryLens)
+        if (state.lensFacing != CameraSelector.LENS_FACING_BACK) {
+            backgroundLensManager.release()
+            return
+        }
+        val backLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
+        val mainLens = backLenses.firstOrNull { it.isPrimaryMain }
+            ?: backLenses.firstOrNull { it.lensType == LensType.WIDE && !it.isZoomPreset }
+            ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
+        val ultraWideLens = backLenses.firstOrNull { it.lensType == LensType.ULTRAWIDE }
+
+        if (settings.isBackgroundLensPreparationUnset() && settings.instantLensSwitching && mainLens != null && ultraWideLens != null) {
+            val mode = backgroundLensManager.detectSimultaneousStreamingMode(mainLens, ultraWideLens)
+            if (mode == io.github.realkhfan.foco.camera.lens.DualStreamingMode.CONCURRENT_DEVICES ||
+                mode == io.github.realkhfan.foco.camera.lens.DualStreamingMode.LOGICAL_MULTI_CAMERA_PHYSICAL
+            ) {
+                settings.backgroundLensPreparation = true
+                Log.i(TAG, "[STANDBY_READY] auto-enabled Keep Ultra Wide Ready; dualMode=$mode")
+            }
+        }
+
+        if (settings.backgroundLensPreparation) {
+            backgroundLensManager.prepareSecondaryLens(mainLens, ultraWideLens)
+            Log.i(TAG, "[STANDBY_READY] requested=${settings.backgroundLensPreparation} instant=${settings.instantLensSwitching} ready=${backgroundLensManager.isStandbyReady()} lens=${backgroundLensManager.getStandbyLens()?.displayName}")
         } else {
             backgroundLensManager.release()
         }
     }
 
     fun instantLensSwitchingChanged() {
-        // Preference updated in settings
+        // "Instant Lens Switching" uses the same persistent Keep Ultra Wide Ready stream.
+        // It never opens a camera itself; readiness is owned by BackgroundLensManager.
+        backgroundLensPrepChanged()
     }
 
     fun autoLensSelectionChanged() {
