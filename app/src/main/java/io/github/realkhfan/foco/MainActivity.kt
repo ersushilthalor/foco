@@ -227,7 +227,7 @@ open class MainActivity : ComponentActivity() {
 
                         val cameraXPreview = PreviewView(context).apply {
                             scaleType = PreviewView.ScaleType.FILL_CENTER
-                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
                         }
                         addView(
                             cameraXPreview,
@@ -272,11 +272,13 @@ open class MainActivity : ComponentActivity() {
                         tv.alpha = mainAlpha
                         tv.translationZ = mainZ
                         tv.visibility = android.view.View.VISIBLE
+                        engine.applyViewfinderTransform(tv)
                     }
                     engine.ultraWideTextureView?.let { tv ->
                         tv.alpha = uwAlpha
                         tv.translationZ = uwZ
                         tv.visibility = android.view.View.VISIBLE
+                        engine.applyViewfinderTransform(tv)
                     }
                 },
                 modifier = modifier,

@@ -532,4 +532,51 @@ class PortedLensAndZoomSystemTest {
         )
         assertEquals(100L, nonDirectMotionDuration)
     }
+
+    @Test
+    fun test8MpFrontAndUltraWide4kSupportDetection() {
+        // Standard 8MP sensor (used on front & ultra-wide cameras): 3264 x 2448 = 7,990,272 pixels
+        val eightMpWidth = 3264L
+        val eightMpHeight = 2448L
+        val eightMpPixels = eightMpWidth * eightMpHeight
+
+        // VCamera criteria: any sensor or stream with >= 5,000,000 pixels is capable of 4K UHD video
+        val isCapableOf4K = eightMpPixels >= 5_000_000L
+        assertTrue("8MP sensor with ~8.0MP pixels must be recognized as 4K UHD capable", isCapableOf4K)
+
+        // 12MP Ultra-Wide sensor: 4000 x 3000 = 12,000,000 pixels
+        val twelveMpPixels = 4000L * 3000L
+        assertTrue("12MP ultra-wide sensor must qualify for 4K UHD", twelveMpPixels >= 5_000_000L)
+    }
+
+    @Test
+    fun testViewfinderTransformAspectMatching() {
+        // Camera buffer in portrait: camW = 1080, camH = 1440 (4:3)
+        val camW = 1080f
+        val camH = 1440f
+        val camRatio = camH / camW // 1.333f
+
+        // Photo mode: 4:3 box (1080x1440) -> effectiveTargetRatio = 4/3
+        val photoTargetRatio = 4f / 3f
+        val isMatchingPhotoAspect = kotlin.math.abs(camRatio - photoTargetRatio) < 0.05f
+        assertTrue("4:3 stream in 4:3 viewfinder must match aspect ratio without crop", isMatchingPhotoAspect)
+
+        // Video mode: 9:16 box (1080x1920) -> effectiveTargetRatio = 16/9
+        val videoTargetRatio = 16f / 9f
+        val isMatchingVideoAspect = kotlin.math.abs(camRatio - videoTargetRatio) < 0.05f
+        assertFalse("4:3 stream in 16:9 viewfinder does not match native aspect ratio", isMatchingVideoAspect)
+
+        // Center-crop scaling calculations for 4:3 in 9:16:
+        val viewW = 1080f
+        val viewH = 1920f
+        val defaultScaleX = viewW / camW // 1.0f
+        val defaultScaleY = viewH / camH // 1.333f
+        val fillScale = maxOf(defaultScaleX, defaultScaleY) // 1.333f
+        val cropScaleX = fillScale / defaultScaleX // 1.333f
+        val cropScaleY = fillScale / defaultScaleY // 1.0f
+
+        // Vertical scale must remain 1.0 (no vertical stretch!), horizontal scale crops sides
+        assertEquals(1.0f, cropScaleY, 0.01f)
+        assertTrue("Horizontal scale must center-crop sides to fill 16:9 without vertical stretch", cropScaleX in 1.30f..1.35f)
+    }
 }

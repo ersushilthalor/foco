@@ -35,6 +35,7 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import androidx.annotation.OptIn
@@ -161,6 +162,7 @@ class CameraEngine(
     private var targetDiscoveredLens: LensInfo? = null
     private val isSwitchingLens = java.util.concurrent.atomic.AtomicBoolean(false)
     private val lensSwitchGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+    private var lastLensSwitchStartTimeMs = 0L
     private var firstTargetFrameArrived = false
     private var desiredZoom = 1f
     private var logicalMinZoom = 1f
@@ -356,6 +358,86 @@ class CameraEngine(
         }
     }
 
+    fun applyViewfinderTransform(
+        tv: TextureView,
+        viewWidth: Int = tv.width,
+        viewHeight: Int = tv.height,
+        previewW: Int = camera2PreviewSize.width,
+        previewH: Int = camera2PreviewSize.height
+    ) {
+        val viewW = if (viewWidth > 0) viewWidth.toFloat() else tv.width.toFloat()
+        val viewH = if (viewHeight > 0) viewHeight.toFloat() else tv.height.toFloat()
+        if (viewW <= 0f || viewH <= 0f || previewW <= 0 || previewH <= 0) return
+
+        val wide = state.kind == CaptureKind.VIDEO || settings.ratio == RatioSetting.WIDE_9_16
+        val targetRatio = if (wide) 16f / 9f else 4f / 3f
+
+        val matrix = Matrix()
+        val centerX = viewW / 2f
+        val centerY = viewH / 2f
+
+        val bufW = previewW.toFloat()
+        val bufH = previewH.toFloat()
+        val displayRotation = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                tv.display?.rotation ?: context.display?.rotation ?: Surface.ROTATION_0
+            } else {
+                @Suppress("DEPRECATION")
+                val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+                @Suppress("DEPRECATION")
+                wm?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+            }
+        } catch (_: Throwable) {
+            Surface.ROTATION_0
+        }
+
+        val isLandscapeDisplay = (displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270)
+        val camW = if (isLandscapeDisplay) maxOf(bufW, bufH) else minOf(bufW, bufH)
+        val camH = if (isLandscapeDisplay) minOf(bufW, bufH) else maxOf(bufW, bufH)
+
+        val effectiveTargetRatio = if (targetRatio > 0f) {
+            targetRatio
+        } else {
+            if (isLandscapeDisplay) (viewW / viewH) else (viewH / viewW)
+        }
+        val camRatio = if (isLandscapeDisplay) (camW / camH) else (camH / camW)
+
+        val isMatchingTargetAspect = kotlin.math.abs(camRatio - effectiveTargetRatio) < 0.05f
+        val (cropScaleX, cropScaleY) = if (isMatchingTargetAspect) {
+            Pair(1.0f, 1.0f)
+        } else {
+            val defaultScaleX = viewW / camW
+            val defaultScaleY = viewH / camH
+            val fillScale = maxOf(defaultScaleX, defaultScaleY)
+            Pair(fillScale / defaultScaleX, fillScale / defaultScaleY)
+        }
+
+        if (isLandscapeDisplay) {
+            val bufferRect = RectF(0f, 0f, bufH, bufW)
+            val viewRect = RectF(0f, 0f, viewW, viewH)
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            if (cropScaleX != 1.0f || cropScaleY != 1.0f) {
+                matrix.postScale(cropScaleX, cropScaleY, centerX, centerY)
+            }
+            matrix.postRotate((90 * (displayRotation - 2)).toFloat(), centerX, centerY)
+        } else if (displayRotation == Surface.ROTATION_180) {
+            matrix.postRotate(180f, centerX, centerY)
+            if (cropScaleX != 1.0f || cropScaleY != 1.0f) {
+                matrix.postScale(cropScaleX, cropScaleY, centerX, centerY)
+            }
+        } else {
+            // Standard portrait:
+            if (cropScaleX != 1.0f || cropScaleY != 1.0f) {
+                matrix.postScale(cropScaleX, cropScaleY, centerX, centerY)
+            }
+        }
+
+        mainHandler.post {
+            tv.setTransform(matrix)
+        }
+    }
+
     fun updateCamera2TextureTransform(
         viewWidth: Int,
         viewHeight: Int,
@@ -364,27 +446,7 @@ class CameraEngine(
         targetView: TextureView? = null
     ) {
         val tv = targetView ?: camera2TextureView ?: return
-        if (viewWidth <= 0 || viewHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) return
-        val matrix = Matrix()
-        val centerX = viewWidth / 2f
-        val centerY = viewHeight / 2f
-
-        // In portrait (viewHeight > viewWidth), sensor dimensions are rotated 90 degrees
-        val isPortrait = viewHeight > viewWidth
-        val bufferW = if (isPortrait) previewHeight.toFloat() else previewWidth.toFloat()
-        val bufferH = if (isPortrait) previewWidth.toFloat() else previewHeight.toFloat()
-
-        // Match PreviewView ScaleType.FILL_CENTER
-        val scale = kotlin.math.max(viewWidth.toFloat() / bufferW, viewHeight.toFloat() / bufferH)
-        val scaledW = bufferW * scale
-        val scaledH = bufferH * scale
-
-        val scaleX = scaledW / viewWidth.toFloat()
-        val scaleY = scaledH / viewHeight.toFloat()
-        matrix.setScale(scaleX, scaleY, centerX, centerY)
-        mainHandler.post {
-            tv.setTransform(matrix)
-        }
+        applyViewfinderTransform(tv, viewWidth, viewHeight, previewWidth, previewHeight)
     }
 
     private fun ensureCamera2TextureView(host: FrameLayout) {
@@ -415,6 +477,13 @@ class CameraEngine(
             // GONE can prevent TextureView from creating a SurfaceTexture until after CameraDevice has opened.
             visibility = android.view.View.VISIBLE
             alpha = 0f
+            addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+                val w = r - l
+                val h = b - t
+                if (w > 0 && h > 0 && (w != (or - ol) || h != (ob - ot))) {
+                    applyViewfinderTransform(this, w, h)
+                }
+            }
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
                     LensDebugLog.log("TextureView available: ${width}x${height}")
@@ -422,7 +491,7 @@ class CameraEngine(
                     backgroundLensManager.setMainSurfaceTexture(st, width, height)
                     camera2Surface?.release()
                     camera2Surface = Surface(st)
-                    updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
+                    applyViewfinderTransform(this@apply, width, height)
                     if (isCamera2Active && camera2Device != null && camera2Session == null) {
                         mainHandler.post {
                             if (isCamera2Active && camera2Device != null && camera2Session == null) {
@@ -437,7 +506,7 @@ class CameraEngine(
                     LensDebugLog.log("TextureView size changed: ${width}x${height}")
                     st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
                     backgroundLensManager.setMainSurfaceTexture(st, width, height)
-                    updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
+                    applyViewfinderTransform(this@apply, width, height)
                 }
 
                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
@@ -489,10 +558,17 @@ class CameraEngine(
 
     fun setUltraWidePreviewTextureView(tv: TextureView) {
         ultraWideTextureView = tv
+        tv.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+            val w = r - l
+            val h = b - t
+            if (w > 0 && h > 0 && (w != (or - ol) || h != (ob - ot))) {
+                applyViewfinderTransform(tv, w, h)
+            }
+        }
         tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
                 backgroundLensManager.setUltraWideSurfaceTexture(st, width, height)
-                updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height, tv)
+                applyViewfinderTransform(tv, width, height)
                 if (settings.backgroundLensPreparation) {
                     val backLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
                     val mainLens = backLenses.firstOrNull { it.isPrimaryMain } ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
@@ -505,7 +581,7 @@ class CameraEngine(
 
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
                 backgroundLensManager.setUltraWideSurfaceTexture(st, width, height)
-                updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height, tv)
+                applyViewfinderTransform(tv, width, height)
             }
 
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
@@ -1650,14 +1726,25 @@ class CameraEngine(
             }
             Setup.VIDEO, Setup.VIDEO_NO_SNAPSHOT, Setup.VIDEO_SIMPLE -> {
                 val simple = setup == Setup.VIDEO_SIMPLE
-                val quality = if (settings.videoResolution == VideoResolution.UHD && caps.uhdSupported && !simple) Quality.UHD else Quality.FHD
+                val isUhd = settings.videoResolution == VideoResolution.UHD && caps.uhdSupported && !simple
+                val qualitySelector = if (isUhd) {
+                    QualitySelector.fromOrderedList(
+                        listOf(Quality.UHD, Quality.HIGHEST, Quality.FHD),
+                        FallbackStrategy.lowerQualityOrHigherThan(Quality.UHD)
+                    )
+                } else {
+                    QualitySelector.from(Quality.FHD, FallbackStrategy.lowerQualityOrHigherThan(Quality.FHD))
+                }
                 val recorder = Recorder.Builder()
-                    .setQualitySelector(QualitySelector.from(quality, FallbackStrategy.lowerQualityOrHigherThan(quality)))
+                    .setQualitySelector(qualitySelector)
                     .setAspectRatio(AspectRatio.RATIO_16_9)
                     .build()
                 val builder = VideoCapture.Builder(recorder)
                     .setTargetRotation(targetRotation)
                     .setMirrorMode(MirrorMode.MIRROR_MODE_ON_FRONT_ONLY)
+                if (physicalCameraId != null) {
+                    Camera2Interop.Extender(builder).setPhysicalCameraId(physicalCameraId)
+                }
                 if (!simple) {
                     if (settings.stabilization && caps.stabilizationSupported) builder.setVideoStabilizationEnabled(true)
                     when {
@@ -1759,6 +1846,37 @@ class CameraEngine(
         val evRange = exposure.exposureCompensationRange
         val evStep = exposure.exposureCompensationStep
 
+        val streamMap = ch(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val surfaceSizes = streamMap?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+        val mediaRecorderSizes = streamMap?.getOutputSizes(android.media.MediaRecorder::class.java) ?: emptyArray()
+        val activeArray = ch(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val sensorPixels = if (activeArray != null) activeArray.width().toLong() * activeArray.height().toLong() else 0L
+
+        // Detect 4K UHD support same as VCamera:
+        // Native UHD in CamcorderProfile OR sensor / video stream capacity with >= 5.0 MP (e.g. 8MP sensors)
+        val canCurrentCameraSupport4K = Quality.UHD in sdrQualities ||
+            mediaRecorderSizes.any { it.width >= 3840 && it.height >= 2160 } ||
+            mediaRecorderSizes.any { (it.width.toLong() * it.height.toLong()) >= 5_000_000L } ||
+            surfaceSizes.any { it.width >= 3840 && it.height >= 2160 } ||
+            surfaceSizes.any { (it.width.toLong() * it.height.toLong()) >= 5_000_000L } ||
+            sensorPixels >= 5_000_000L
+
+        val canAnyBackCameraSupport4K = isBack && discoveredBackLenses.any { lens ->
+            val lensChars = try { cameraManager?.getCameraCharacteristics(lens.cameraId) } catch (_: Throwable) { null }
+            val lensMap = lensChars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val lensSurfaces = lensMap?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+            val lensRecorders = lensMap?.getOutputSizes(android.media.MediaRecorder::class.java) ?: emptyArray()
+            val lensArray = lensChars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            val lensPixels = if (lensArray != null) lensArray.width().toLong() * lensArray.height().toLong() else 0L
+            lensRecorders.any { it.width >= 3840 && it.height >= 2160 } ||
+                lensRecorders.any { (it.width.toLong() * it.height.toLong()) >= 5_000_000L } ||
+                lensSurfaces.any { it.width >= 3840 && it.height >= 2160 } ||
+                lensSurfaces.any { (it.width.toLong() * it.height.toLong()) >= 5_000_000L } ||
+                lensPixels >= 5_000_000L
+        }
+
+        val isUhdAvailable = canCurrentCameraSupport4K || canAnyBackCameraSupport4K
+
         return Capabilities(
             hasFlash = info.hasFlashUnit(),
             rawSupported = ImageCapture.OUTPUT_FORMAT_RAW_JPEG in formats,
@@ -1769,7 +1887,7 @@ class CameraEngine(
             ultrawideId = ultrawide,
             macroAvailable = hasMacro,
             manualLensAvailable = selectable.size > 1 || discoveredBackLenses.size > 1,
-            uhdSupported = Quality.UHD in sdrQualities,
+            uhdSupported = isUhdAvailable,
             fps60Supported = fps60,
             stabilizationSupported = stabilization,
             hdrVideoSupported = hdrVideo,
@@ -2003,7 +2121,8 @@ class CameraEngine(
     }
 
     fun selectDiscoveredLens(lens: LensInfo, targetZoom: Float, isContinuous: Boolean) {
-        if (isSwitchingLens.get() && targetDiscoveredLens?.id == lens.id) {
+        val nowMs = SystemClock.uptimeMillis()
+        if (isSwitchingLens.get() && targetDiscoveredLens?.id == lens.id && (nowMs - lastLensSwitchStartTimeMs <= 1800L)) {
             LensDebugLog.log("selectDiscoveredLens ignored: switch to ${lens.displayName} (id=${lens.id}) already in flight")
             return
         }
@@ -2013,7 +2132,9 @@ class CameraEngine(
             (currentLens.id != lens.id) ||
             (currentLens.lensType != lens.lensType) ||
             (lens.physicalCameraId != boundPhysicalId) ||
-            (lens.isIndependentCamera && lens.cameraId != boundCameraId)
+            (lens.isIndependentCamera && lens.cameraId != boundCameraId) ||
+            (lens.lensType == LensType.ULTRAWIDE && !isUsingUltraWideSurface.value) ||
+            ((lens.lensType == LensType.WIDE || lens.isPrimaryMain) && isUsingUltraWideSurface.value)
 
         val officialIds = try { cameraManager?.cameraIdList?.toSet() ?: emptySet() } catch (_: Throwable) { emptySet() }
         val inOfficial = lens.cameraId in officialIds
@@ -2029,15 +2150,12 @@ class CameraEngine(
         if (isDifferentLens && !isRecording && !isBursting) {
             val chars = try { cameraManager?.getCameraCharacteristics(lens.cameraId) } catch (_: Throwable) { null }
             val supportsLogicalZoom = CameraDiscovery.canUseLogicalZoomForLens(lens.cameraId, lens, targetZoom, chars)
-            // A logical multi-camera can only service the handoff if THAT logical device is the
-            // device currently bound/open. Merely having logical-multicam characteristics on the
-            // target camera is not sufficient when the active stream is an independent aux ID.
             val activeDeviceCameraId = when {
                 isCamera2Active -> camera2Device?.id
                 camera != null -> boundCameraId
                 else -> null
             }
-            val canUseLogical = supportsLogicalZoom && activeDeviceCameraId == lens.cameraId
+            val canUseLogical = supportsLogicalZoom && activeDeviceCameraId == lens.cameraId && !isUsingUltraWideSurface.value
             val strategy = CameraDiscovery.resolveSwitchStrategy(currentLens, lens)
 
             LensDebugLog.log(
@@ -2058,15 +2176,22 @@ class CameraEngine(
     }
 
     fun switchCameraToLens(targetLens: LensInfo, targetZoom: Float) {
-        if (isSwitchingLens.get() && targetDiscoveredLens?.id == targetLens.id) {
-            LensDebugLog.log("switchCameraToLens ignored: switch to ${targetLens.displayName} (id=${targetLens.id}) already in flight")
-            return
+        val nowMs = SystemClock.uptimeMillis()
+        if (!isSwitchingLens.compareAndSet(false, true)) {
+            if (nowMs - lastLensSwitchStartTimeMs > 1800L) {
+                Log.w(TAG, "Previous lens switch timed out (>1800ms), forcing new switch to ${targetLens.displayName}")
+                isSwitchingLens.set(true)
+            } else if (targetDiscoveredLens?.id == targetLens.id) {
+                LensDebugLog.log("switchCameraToLens ignored: switch to ${targetLens.displayName} (id=${targetLens.id}) already in flight")
+                return
+            }
         }
+        lastLensSwitchStartTimeMs = nowMs
+
         val currentLens = activeDiscoveredLens
         val strategy = CameraDiscovery.resolveSwitchStrategy(currentLens, targetLens)
         targetDiscoveredLens = targetLens
         desiredZoom = targetZoom
-        isSwitchingLens.set(true)
         firstTargetFrameArrived = false
         val switchGen = lensSwitchGeneration.incrementAndGet()
 
@@ -2090,77 +2215,32 @@ class CameraEngine(
             provider?.hasCamera(filter) == true
         }.getOrDefault(false)
 
-        if (isUw || targetZoom < 0.95f) {
-            val path = if (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0")) "Camera2" else "CameraX physical"
-            Log.i("LensDiag", "[0.5x REQUEST] switchCameraToLens: ${targetLens.displayName}, Strategy: $path (isHiddenAux=$isHiddenAux, cameraXHasCamera=$cameraXHasCamera)")
-        }
-
         val isSwitchBetweenMainAndUW = (currentLens?.lensType == LensType.WIDE && targetLens.lensType == LensType.ULTRAWIDE) ||
             (currentLens?.lensType == LensType.ULTRAWIDE && targetLens.lensType == LensType.WIDE) ||
-            (targetLens.lensType == LensType.WIDE && isCamera2Active && targetLens.cameraId != camera2Device?.id)
+            (targetLens.lensType == LensType.WIDE && isUsingUltraWideSurface.value)
 
         // 1. True 0ms instant stream swap when background preparation is ready!
-        if (settings.backgroundLensPreparation && isSwitchBetweenMainAndUW &&
-            backgroundLensManager.isStandbyReady() &&
-            backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
+        if (settings.backgroundLensPreparation && isSwitchBetweenMainAndUW && backgroundLensManager.isStandbyReady()) {
+            val toUltraWide = (targetLens.lensType == LensType.ULTRAWIDE)
+            Log.i(TAG, "[LENS_SWITCH] 0ms instant stream switch to ${targetLens.displayName} (toUltraWide=$toUltraWide)")
 
-            Log.i(TAG, "[LENS_SWITCH] Performing 0ms instant stream swap using prewarmed standby camera for ${targetLens.displayName}")
-            val activeSurf = if (isCamera2Active) camera2Surface else null
-            val swapResult = backgroundLensManager.swapActiveAndStandby(
-                oldActiveDevice = camera2Device,
-                oldActiveSession = camera2Session,
-                oldActiveBuilder = camera2RequestBuilder,
-                oldActiveSurface = activeSurf,
-                targetLens = targetLens,
-                availableLenses = inventory.lenses
-            )
-            if (swapResult != null) {
-                camera2Device = swapResult.newActiveDevice
-                camera2Session = swapResult.newActiveSession
-                camera2RequestBuilder = swapResult.newActiveBuilder
-                camera2Surface = swapResult.newActiveSurface
-                isCamera2Active = true
-                boundCameraId = swapResult.newActiveDevice.id
-                boundPhysicalId = targetLens.physicalCameraId
-                isUsingUltraWideSurface.value = (targetLens.lensType == LensType.ULTRAWIDE)
-                activeDiscoveredLens = targetLens
-                targetDiscoveredLens = null
-                isSwitchingLens.set(false)
-                firstTargetFrameArrived = true
-                zoomFactor = targetLens.baseZoomRatio
-                state.zoom = targetZoom
-                desiredZoom = targetZoom
+            isUsingUltraWideSurface.value = toUltraWide
+            activeDiscoveredLens = targetLens
+            targetDiscoveredLens = null
+            isSwitchingLens.set(false)
+            firstTargetFrameArrived = true
+            zoomFactor = if (toUltraWide) targetLens.baseZoomRatio else 1.0f
+            state.zoom = targetZoom
+            desiredZoom = targetZoom
 
-                swapResult.newActiveBuilder?.let { builder ->
-                    applyCamera2Zoom(targetZoom, builder)
-                    try {
-                        swapResult.newActiveSession.setRepeatingRequest(
-                            builder.build(),
-                            null,
-                            camera2Handler
-                        )
-                    } catch (_: Throwable) {}
-                }
+            backgroundLensManager.syncStandbyStreamSettings(inventory.lenses, targetZoom)
 
-                if (camera != null) {
-                    try {
-                        provider?.unbindAll()
-                        camera = null
-                        imageCapture = null
-                        videoCapture = null
-                        analysis = null
-                    } catch (_: Throwable) {}
-                }
-
-                Log.i(TAG, "[LENS_SWITCH_SUCCESS] 0ms instant stream swap completed to ${targetLens.displayName} (activeCameraId=${swapResult.newActiveDevice.id})")
-                LensDebugLog.log("0ms instant stream swap completed to ${targetLens.displayName}")
-                return
-            }
+            Log.i(TAG, "[LENS_SWITCH_SUCCESS] 0ms instant stream switch completed to ${targetLens.displayName}")
+            LensDebugLog.log("0ms instant stream switch completed to ${targetLens.displayName}")
+            return
         }
 
-        // 2. For hidden auxiliary lenses (e.g. vendor aux camera ID 2, 3, etc.) or when CameraX doesn't have the camera ID,
-        // or for Ultra-Wide when on a separate camera ID:
-        // Use Camera2 API directly without black screen: keep the current stream visible while opening Camera2!
+        // 2. Fallback: activate Camera2 directly when standby is not pre-warmed
         if (!isPrimaryMainCameraX && (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0"))) {
             Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
             zoomFactor = targetLens.baseZoomRatio
@@ -2168,39 +2248,33 @@ class CameraEngine(
             return
         }
 
-        // 3. Returning from Camera2 to Main:
-        // Keep the Ultra-Wide view visible while CameraX binds, preventing black frames.
+        // 3. Fallback: returning from Camera2 to Main when standby is not pre-warmed
         if (isCamera2Active) {
             val closingCameraId = camera2Device?.id
             Log.i(TAG, "[LENS_SWITCH_CAMX] Returning to ${targetLens.displayName} from Camera2 ID $closingCameraId")
             LensDebugLog.log("return to CameraX requested: target=${targetLens.displayName}, closingCameraId=$closingCameraId")
 
             activeDiscoveredLens = targetLens
-            targetDiscoveredLens = targetLens
+            targetDiscoveredLens = null
+            isSwitchingLens.set(false)
             desiredZoom = targetZoom
             state.zoom = targetZoom
-            if (targetLens.isPrimaryMain || targetLens.lensType == LensType.WIDE) {
-                zoomFactor = 1f
-                boundPhysicalId = null
-                if (settings.manualLens) state.manualLensId = null
-            } else if (settings.manualLens) {
-                state.manualLensId = targetLens.physicalCameraId ?: targetLens.cameraId
-            }
+            zoomFactor = 1f
+            boundPhysicalId = null
+            if (settings.manualLens) state.manualLensId = null
 
+            closeCamera2(keepTexture = true)
+            isUsingUltraWideSurface.value = false
             rebind()
-
-            mainHandler.postDelayed({
-                isUsingUltraWideSurface.value = false
-                closeCamera2(keepTexture = true)
-                isSwitchingLens.set(false)
-            }, 300L)
             return
         }
 
+        activeDiscoveredLens = targetLens
+        targetDiscoveredLens = null
+        isSwitchingLens.set(false)
         if (settings.manualLens) {
             state.manualLensId = targetLens.physicalCameraId ?: targetLens.cameraId
         }
-
         rebind()
     }
 
@@ -2489,6 +2563,29 @@ class CameraEngine(
      * [onResult] gets the saved JPEG's URI.
      */
     fun takePhoto(toFile: File?, onResult: (Uri?, Throwable?) -> Unit) {
+        if (isUsingUltraWideSurface.value) {
+            val tv = ultraWideTextureView ?: camera2TextureView
+            val bmp = tv?.bitmap
+            if (bmp != null) {
+                try {
+                    val baos = java.io.ByteArrayOutputStream()
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 95, baos)
+                    val bytes = baos.toByteArray()
+                    val uri = PhotoWriter.save(
+                        context = context,
+                        jpeg = bytes,
+                        name = MediaNaming.baseName(System.currentTimeMillis()),
+                        toFile = toFile
+                    )
+                    onResult(uri, null)
+                } catch (t: Throwable) {
+                    onResult(null, t)
+                } finally {
+                    bmp.recycle()
+                }
+                return
+            }
+        }
         if (isCamera2Active && camera2Device != null && camera2Session != null) {
             camera2CaptureStill(toFile, onResult)
             return
