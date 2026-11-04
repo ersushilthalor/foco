@@ -1,5 +1,8 @@
 package io.github.realkhfan.foco.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -33,6 +36,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -94,6 +98,8 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -105,6 +111,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.realkhfan.foco.R
 import io.github.realkhfan.foco.camera.ExposureMath
 import io.github.realkhfan.foco.camera.ZoomMath
 import io.github.realkhfan.foco.device.MicStatus
@@ -157,7 +164,7 @@ fun CameraScreen(
                 .aspectRatio(if (wide) 9f / 16f else 3f / 4f),
         ) {
             preview(Modifier.fillMaxSize())
-            ViewfinderOverlays(state, settings, actions)
+            ViewfinderOverlays(state, settings, actions, iconRotation)
         }
 
         TopBar(state, settings, actions, iconRotation, Modifier.align(Alignment.TopCenter).padding(top = statusTop))
@@ -214,21 +221,45 @@ private fun rememberIconRotation(deviceRotation: Int): Float {
 // ------------------------------------------------------------------------------------- viewfinder
 
 @Composable
-private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: CameraActions) {
+private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: CameraActions, iconRotation: Float) {
     var size by remember { mutableStateOf(IntSize.Zero) }
     val density = LocalDensity.current
     val swipeThreshold = with(density) { 70.dp.toPx() }
     val touchSlop = with(density) { 12.dp.toPx() }
+    val hasAdjustableZoom = state.cameraReady &&
+        state.minZoom.isFinite() && state.maxZoom.isFinite() &&
+        state.minZoom > 0f && state.maxZoom > state.minZoom
+    var zoomPanelVisible by remember { mutableStateOf(false) }
+    var zoomPanelRequest by remember { mutableStateOf(0) }
 
+    LaunchedEffect(zoomPanelRequest) {
+        if (zoomPanelRequest > 0) {
+            zoomPanelVisible = true
+            delay(2_000L)
+            zoomPanelVisible = false
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
     Box(
         Modifier
             .fillMaxSize()
             .onSizeChanged { size = it }
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = { if (state.review == null && !state.burstActive) actions.focusAt(it, size.width, size.height, lock = false) },
+                    onTap = {
+                        if (state.review == null && !state.burstActive) {
+                            actions.focusAt(it, size.width, size.height, lock = false)
+                            if (hasAdjustableZoom) zoomPanelRequest++
+                        }
+                    },
                     onDoubleTap = { actions.setZoom(if (state.zoom < 1.9f) 2f else 1f, fromChip = true) },
-                    onLongPress = { if (!state.burstActive) actions.focusAt(it, size.width, size.height, lock = true) },
+                    onLongPress = {
+                        if (!state.burstActive) {
+                            actions.focusAt(it, size.width, size.height, lock = true)
+                            if (hasAdjustableZoom) zoomPanelRequest++
+                        }
+                    },
                 )
             }
             .pointerInput(Unit) {
@@ -288,6 +319,44 @@ private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: 
             )
         }
     }
+
+    AnimatedVisibility(
+        visible = zoomPanelVisible && hasAdjustableZoom && !state.burstActive && state.review == null,
+        enter = fadeIn(tween(0)),
+        exit = fadeOut(tween(300)),
+        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 16.dp),
+    ) {
+        val zoomRange = state.maxZoom - state.minZoom
+        val linearZoom = ((state.zoom - state.minZoom) / zoomRange).coerceIn(0f, 1f)
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Image(
+                painter = painterResource(R.drawable.foco_vibecam_zoom_in),
+                contentDescription = null,
+                modifier = Modifier.padding(bottom = 10.dp).size(24.dp).rotate(iconRotation),
+            )
+            AndroidView(
+                factory = { context ->
+                    FocoZoomBar(context).apply {
+                        renderZoom(linearZoom, state.zoom) { linear ->
+                            actions.setZoom((state.minZoom + linear * zoomRange).coerceIn(state.minZoom, state.maxZoom))
+                        }
+                    }
+                },
+                modifier = Modifier.width(32.dp).height(250.dp),
+                update = { bar ->
+                    bar.renderZoom(linearZoom, state.zoom) { linear ->
+                        actions.setZoom((state.minZoom + linear * zoomRange).coerceIn(state.minZoom, state.maxZoom))
+                    }
+                },
+            )
+            Image(
+                painter = painterResource(R.drawable.foco_vibecam_zoom_out),
+                contentDescription = null,
+                modifier = Modifier.padding(top = 10.dp, bottom = 32.dp).size(24.dp).rotate(iconRotation),
+            )
+        }
+    }
+}
 }
 
 /** Swiping across the viewfinder walks through the photo modes: left = the mode on the right. */
@@ -837,13 +906,11 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
                 )
             }
         }
-        Box(Modifier.fillMaxWidth().height(104.dp), contentAlignment = Alignment.BottomCenter) {
+        Box(Modifier.fillMaxWidth().height(132.dp), contentAlignment = Alignment.BottomCenter) {
             val tool = state.activeTool
             when {
                 state.burstActive -> Unit
                 tool != null && state.proBarOpen -> ToolSlider(state, tool, actions, Modifier.padding(bottom = 4.dp))
-                state.zoomChips.size > 1 && !(state.kind == CaptureKind.PHOTO && state.photoMode == PhotoMode.PANORAMA) ->
-                    ZoomChips(state, actions, iconRotation, Modifier.padding(bottom = 34.dp))
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -862,51 +929,6 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
     }
 }
 
-@Composable
-private fun ZoomChips(state: AppState, actions: CameraActions, iconRotation: Float, modifier: Modifier) {
-    val chips = state.zoomChips
-    val selected = ZoomMath.selectedIndex(chips, state.zoom)
-    val primary = MaterialTheme.colorScheme.primary
-    val onPrimary = MaterialTheme.colorScheme.onPrimary
-    Row(
-        modifier
-            .clip(CircleShape)
-            .background(Color(0xB31E1F22))
-            .pointerInput(Unit) {
-                detectHorizontalDragGestures { change, dragAmount ->
-                    change.consume()
-                    actions.setZoom((state.zoom * exp(dragAmount / 260f)).coerceIn(state.minZoom, state.maxZoom))
-                }
-            }
-            .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        chips.forEachIndexed { i, chip ->
-            val isSelected = i == selected
-            Box(
-                Modifier
-                    .size(44.dp)
-                    .clip(CircleShape)
-                    .background(if (isSelected) primary else Color.Transparent)
-                    .clickable {
-                        actions.haptic()
-                        actions.setZoom(chip, fromChip = true)
-                    }
-                    .semantics { contentDescription = "Zoom ${ZoomMath.formatZoom(chip)}" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    ZoomMath.chipLabel(chip, state.zoom, isSelected),
-                    color = if (isSelected) onPrimary else Color.White,
-                    fontSize = if (isSelected) 14.sp else 13.sp,
-                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                    modifier = Modifier.rotate(iconRotation),
-                )
-            }
-        }
-    }
-}
 
 @Composable
 private fun ShutterRow(state: AppState, settings: AppSettings, actions: CameraActions, iconRotation: Float) {
