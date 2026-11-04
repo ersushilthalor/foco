@@ -10,7 +10,7 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.widget.TextView
-import androidx.appcompat.widget.AppCompatSeekBar
+import android.widget.SeekBar
 import io.github.realkhfan.foco.R
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -20,7 +20,7 @@ import kotlin.math.roundToInt
  * The rotated measurement, canvas transform, bitmap thumb, and touch-to-linear-zoom mapping
  * intentionally follow VibeCam's ZoomBar implementation.
  */
-internal class FocoZoomBar : AppCompatSeekBar {
+internal class FocoZoomBar : SeekBar {
     constructor(context: Context) : super(context)
     constructor(context: Context, attrs: AttributeSet?) : super(context, attrs)
     constructor(context: Context, attrs: AttributeSet?, defStyle: Int) : super(context, attrs, defStyle)
