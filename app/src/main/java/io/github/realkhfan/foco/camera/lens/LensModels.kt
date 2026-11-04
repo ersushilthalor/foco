@@ -13,7 +13,6 @@ enum class LensType(val shortLabel: String, val fullLabel: String) {
 }
 
 data class LensInfo(
-    val id: String = UUID.randomUUID().toString(),
     val cameraId: String,
     val facing: Int, // CameraCharacteristics.LENS_FACING_BACK, etc.
     val lensType: LensType,
@@ -34,7 +33,8 @@ data class LensInfo(
     val isPrimaryMain: Boolean = false,
     val isIndependentCamera: Boolean = false,
     val supportsPhysicalStream: Boolean = false,
-    val intrinsicZoomRatio: Float = baseZoomRatio
+    val intrinsicZoomRatio: Float = baseZoomRatio,
+    val id: String = "${cameraId}_${physicalCameraId.orEmpty()}_${lensType.name}"
 )
 
 enum class LensSwitchStrategy {

@@ -4,8 +4,11 @@ import android.Manifest
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -243,6 +246,76 @@ class CameraEngine(
     private var camera2SessionGen = java.util.concurrent.atomic.AtomicInteger(0)
     private var camera2PendingStillCapture: ((Uri?, Throwable?) -> Unit)? = null
     private var camera2PendingStillFile: File? = null
+    private var camera2ComboStage = 1
+    private var camera2PreviewSize: Size = Size(1440, 1080)
+    private var camera2WatchdogRunnable: Runnable? = null
+
+    private fun startCamera2Watchdog() {
+        cancelCamera2Watchdog()
+        val r = Runnable {
+            if (isCamera2Active && !firstTargetFrameArrived) {
+                Log.w(TAG, "[CAMERA2_TIMEOUT] No frame arrived within 2.2s on Camera2, falling back to 1x Main")
+                Log.w("LensDiag", "[0.5x TIMEOUT] No preview frame arrived within 2.2s on Camera2 ID ${camera2Device?.id}, falling back to 1x")
+                fallbackToCameraXMain("Ultra-wide preview timed out, returned to 1x")
+            }
+        }
+        camera2WatchdogRunnable = r
+        mainHandler.postDelayed(r, 2200L)
+    }
+
+    private fun cancelCamera2Watchdog() {
+        camera2WatchdogRunnable?.let {
+            mainHandler.removeCallbacks(it)
+            camera2WatchdogRunnable = null
+        }
+    }
+
+    private fun fallbackToCameraXMain(msg: String) {
+        mainHandler.post {
+            cancelCamera2Watchdog()
+            closeCamera2(keepTexture = false)
+            isSwitchingLens.set(false)
+            targetDiscoveredLens = null
+            val backLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
+            val mainLens = backLenses.firstOrNull { it.isPrimaryMain }
+                ?: backLenses.firstOrNull { it.lensType == LensType.WIDE && !it.isZoomPreset }
+                ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
+                ?: backLenses.firstOrNull()
+            activeDiscoveredLens = mainLens
+            state.zoom = 1.0f
+            desiredZoom = 1.0f
+            zoomFactor = 1.0f
+            state.message = msg
+            Log.w(TAG, "[CAMERA2_FALLBACK] Restoring Main lens via CameraX: ${mainLens?.displayName} ($msg)")
+            Log.w("LensDiag", "[0.5x FALLBACK] Restoring Main lens via CameraX: ${mainLens?.displayName}")
+            rebind()
+        }
+    }
+
+    private fun updateCamera2TextureTransform(viewWidth: Int, viewHeight: Int, previewWidth: Int, previewHeight: Int) {
+        val tv = camera2TextureView ?: return
+        if (viewWidth <= 0 || viewHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) return
+        val matrix = Matrix()
+        val centerX = viewWidth / 2f
+        val centerY = viewHeight / 2f
+
+        // In portrait (viewHeight > viewWidth), sensor dimensions are rotated 90 degrees
+        val isPortrait = viewHeight > viewWidth
+        val bufferW = if (isPortrait) previewHeight.toFloat() else previewWidth.toFloat()
+        val bufferH = if (isPortrait) previewWidth.toFloat() else previewHeight.toFloat()
+
+        // Match PreviewView ScaleType.FILL_CENTER
+        val scale = kotlin.math.max(viewWidth.toFloat() / bufferW, viewHeight.toFloat() / bufferH)
+        val scaledW = bufferW * scale
+        val scaledH = bufferH * scale
+
+        val scaleX = scaledW / viewWidth.toFloat()
+        val scaleY = scaledH / viewHeight.toFloat()
+        matrix.setScale(scaleX, scaleY, centerX, centerY)
+        mainHandler.post {
+            tv.setTransform(matrix)
+        }
+    }
 
     private fun ensureCamera2TextureView(view: PreviewView) {
         if (camera2TextureView != null) return
@@ -256,14 +329,18 @@ class CameraEngine(
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
                     camera2Surface?.release()
                     camera2Surface = Surface(st)
+                    st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
+                    updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
                     if (isCamera2Active && camera2Device != null && camera2Session == null) {
-                        createCamera2Session()
+                        createCamera2Session(comboStage = 1)
                     }
                 }
 
                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
                     camera2Surface?.release()
                     camera2Surface = Surface(st)
+                    st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
+                    updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
                 }
 
                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
@@ -277,10 +354,12 @@ class CameraEngine(
                         val target = targetDiscoveredLens
                         if (target != null) {
                             firstTargetFrameArrived = true
+                            cancelCamera2Watchdog()
                             activeDiscoveredLens = target
                             targetDiscoveredLens = null
                             Log.i(TAG, "[CAMERA2_LENS_FRAME] First valid target preview frame arrived on Camera2 ID ${camera2Device?.id} (${target.displayName})")
                             Log.i(TAG, "[LENS_SWITCH_SUCCESS] Switching successfully completed to ${target.displayName} at zoom ${state.zoom}")
+                            Log.i("LensDiag", "[0.5x ACTIVE] First preview frame received, lens ${target.displayName} active")
                         }
                         isSwitchingLens.set(false)
                     }
@@ -301,15 +380,21 @@ class CameraEngine(
             return
         }
 
+        // Release standby camera before opening Camera2 to avoid hardware concurrency limits
+        backgroundLensManager.release()
         closeCamera2(keepTexture = true)
 
         isCamera2Active = true
+        firstTargetFrameArrived = false
+        startCamera2Watchdog()
+
         mainHandler.post {
             camera2TextureView?.visibility = android.view.View.VISIBLE
         }
 
         val openToken = camera2DeviceGen.incrementAndGet()
         Log.i(TAG, "[CAMERA2_OPEN] Opening Camera2 device ID ${lens.cameraId} (${lens.displayName}, isHiddenAux=${lens.isHiddenAux})")
+        Log.i("LensDiag", "[0.5x OPEN] Opening Camera2 device ID ${lens.cameraId} (${lens.displayName})")
 
         try {
             mgr.openCamera(lens.cameraId, object : CameraDevice.StateCallback() {
@@ -322,13 +407,15 @@ class CameraEngine(
                     boundCameraId = device.id
                     boundPhysicalId = lens.physicalCameraId
                     Log.i(TAG, "[CAMERA2_OPENED] Camera2 device ID ${device.id} opened successfully")
-                    createCamera2Session()
+                    Log.i("LensDiag", "[0.5x OPENED] Camera2 device ID ${device.id} opened successfully")
+                    createCamera2Session(comboStage = 1)
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
                     Log.w(TAG, "[CAMERA2_DISCONNECTED] Camera2 device ID ${device.id} disconnected")
+                    Log.w("LensDiag", "[0.5x DISCONNECTED] Camera2 device ID ${device.id} disconnected")
                     if (camera2Device == device) {
-                        closeCamera2(keepTexture = true)
+                        fallbackToCameraXMain("Ultra-wide camera disconnected, returned to 1x")
                     }
                 }
 
@@ -342,66 +429,109 @@ class CameraEngine(
                         else -> "error code $error"
                     }
                     Log.e(TAG, "[CAMERA2_ERROR] Camera2 device ${device.id} error: $errDesc")
+                    Log.e("LensDiag", "[0.5x ERROR] Camera2 device ${device.id} error: $errDesc")
                     if (camera2Device == device || camera2Device == null) {
-                        closeCamera2(keepTexture = true)
-                        isSwitchingLens.set(false)
-                        val msg = "Failed to open Camera2 device ${lens.displayName}: $errDesc"
-                        state.message = msg
+                        fallbackToCameraXMain("Failed to open ${lens.displayName} ($errDesc), returned to 1x")
                     }
                 }
             }, camera2Handler)
         } catch (t: Throwable) {
             Log.e(TAG, "[CAMERA2_ERROR] Exception opening Camera2 device ${lens.cameraId}", t)
-            isSwitchingLens.set(false)
-            state.message = "Failed to open ${lens.displayName}: ${t.message}"
+            Log.e("LensDiag", "[0.5x ERROR] Exception opening Camera2 device ${lens.cameraId}: ${t.message}")
+            fallbackToCameraXMain("Failed to open ${lens.displayName}: ${t.message}, returned to 1x")
         }
     }
 
-    private fun createCamera2Session() {
+    private fun createCamera2Session(comboStage: Int = 1) {
         val device = camera2Device ?: return
         val surf = camera2Surface ?: return
         val lens = targetDiscoveredLens ?: activeDiscoveredLens ?: return
         val configToken = camera2SessionGen.incrementAndGet()
+        camera2ComboStage = comboStage
 
         camera2JpegReader?.close()
+        camera2JpegReader = null
         camera2YuvReader?.close()
+        camera2YuvReader = null
 
         val chars = try { cameraManager?.getCameraCharacteristics(device.id) } catch (_: Throwable) { null }
         val map = chars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
+        val targetAspect = if (settings.ratio == RatioSetting.WIDE_9_16) 16f / 9f else 4f / 3f
+
+        // Preview size (guaranteed preview size <= 1080p)
+        val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java)?.filter {
+            abs(it.width.toFloat() / it.height - targetAspect) < 0.05f
+        }?.sortedByDescending { it.width.toLong() * it.height } ?: emptyList()
+        val previewSize = previewSizes.firstOrNull { it.width <= 1920 && it.height <= 1080 }
+            ?: previewSizes.lastOrNull()
+            ?: Size(if (settings.ratio == RatioSetting.WIDE_9_16) 1920 else 1440, 1080)
+        camera2PreviewSize = previewSize
+
+        val tv = camera2TextureView
+        if (tv != null) {
+            tv.surfaceTexture?.setDefaultBufferSize(previewSize.width, previewSize.height)
+            updateCamera2TextureTransform(tv.width, tv.height, previewSize.width, previewSize.height)
+        }
+
+        // JPEG size
         val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG)?.filter {
-            abs(it.width.toFloat() / it.height - 4f / 3f) < 0.05f
+            abs(it.width.toFloat() / it.height - targetAspect) < 0.05f
         }?.sortedByDescending { it.width.toLong() * it.height }
         val stillSize = jpegSizes?.firstOrNull() ?: Size(4000, 3000)
 
-        val jpegReader = ImageReader.newInstance(stillSize.width, stillSize.height, ImageFormat.JPEG, 2)
-        jpegReader.setOnImageAvailableListener({ reader ->
-            val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                handleCamera2Jpeg(img)
-            } finally {
-                img.close()
-            }
-        }, camera2Handler)
-        camera2JpegReader = jpegReader
-
+        // YUV size: preview-size, <= 1080p, guaranteed stream size (never max sensor size)
         val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888)?.filter {
-            abs(it.width.toFloat() / it.height - 4f / 3f) < 0.05f
+            abs(it.width.toFloat() / it.height - targetAspect) < 0.05f && it.width <= 1920 && it.height <= 1080
         }?.sortedByDescending { it.width.toLong() * it.height }
-        val yuvSize = yuvSizes?.firstOrNull() ?: Size(1920, 1440)
+        val yuvSize = yuvSizes?.firstOrNull() ?: previewSize
 
-        val yuvReader = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 4)
-        yuvReader.setOnImageAvailableListener({ reader ->
-            val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                handleCamera2Yuv(img)
-            } finally {
-                img.close()
+        val outputSurfaces = mutableListOf<Surface>()
+        outputSurfaces.add(surf)
+
+        val comboDesc: String
+        when (comboStage) {
+            1 -> {
+                // Combo 1: [preview + JPEG + YUV(preview-size <= 1080p)]
+                val jpegReader = ImageReader.newInstance(stillSize.width, stillSize.height, ImageFormat.JPEG, 2).apply {
+                    setOnImageAvailableListener({ reader ->
+                        val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                        try { handleCamera2Jpeg(img) } finally { img.close() }
+                    }, camera2Handler)
+                }
+                camera2JpegReader = jpegReader
+                outputSurfaces.add(jpegReader.surface)
+
+                val yuvReader = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 2).apply {
+                    setOnImageAvailableListener({ reader ->
+                        val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                        try { handleCamera2Yuv(img) } finally { img.close() }
+                    }, camera2Handler)
+                }
+                camera2YuvReader = yuvReader
+                outputSurfaces.add(yuvReader.surface)
+                comboDesc = "Combo 1 [preview(${previewSize.width}x${previewSize.height}) + JPEG(${stillSize.width}x${stillSize.height}) + YUV(${yuvSize.width}x${yuvSize.height})]"
             }
-        }, camera2Handler)
-        camera2YuvReader = yuvReader
+            2 -> {
+                // Combo 2: [preview + JPEG]
+                val jpegReader = ImageReader.newInstance(stillSize.width, stillSize.height, ImageFormat.JPEG, 2).apply {
+                    setOnImageAvailableListener({ reader ->
+                        val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                        try { handleCamera2Jpeg(img) } finally { img.close() }
+                    }, camera2Handler)
+                }
+                camera2JpegReader = jpegReader
+                outputSurfaces.add(jpegReader.surface)
+                comboDesc = "Combo 2 [preview(${previewSize.width}x${previewSize.height}) + JPEG(${stillSize.width}x${stillSize.height})]"
+            }
+            else -> {
+                // Combo 3: [preview only]
+                comboDesc = "Combo 3 [preview only (${previewSize.width}x${previewSize.height})]"
+            }
+        }
 
-        val outputSurfaces = listOf(surf, jpegReader.surface, yuvReader.surface)
+        Log.i("LensDiag", "[0.5x REQUEST] Lens: ${lens.displayName}, Strategy: Camera2 (ID ${device.id}), Attempting stream combo $comboStage: $comboDesc")
+        Log.i(TAG, "[CAMERA2] Configuring session with $comboDesc on camera ${device.id}")
 
         try {
             val reqBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -420,7 +550,8 @@ class CameraEngine(
                         return
                     }
                     camera2Session = session
-                    Log.i(TAG, "[CAMERA2_SESSION] Camera2 session configured for camera ID ${device.id}")
+                    Log.i(TAG, "[CAMERA2_SESSION] Camera2 session configured with combo $comboStage: $comboDesc")
+                    Log.i("LensDiag", "[0.5x SUCCESS] Stream combo $comboStage configured successfully on Camera2 ID ${device.id} ($comboDesc)")
                     applyCamera2Pro(reqBuilder)
                     applyCamera2Zoom(desiredZoom, reqBuilder)
 
@@ -443,10 +574,12 @@ class CameraEngine(
                                     val target = targetDiscoveredLens
                                     if (target != null) {
                                         firstTargetFrameArrived = true
+                                        cancelCamera2Watchdog()
                                         activeDiscoveredLens = target
                                         targetDiscoveredLens = null
                                         Log.i(TAG, "[CAMERA2_LENS_FRAME] First valid preview frame arrived on Camera2 ID ${device.id} (${target.displayName})")
                                         Log.i(TAG, "[LENS_SWITCH_SUCCESS] Switching successfully completed to ${target.displayName}")
+                                        Log.i("LensDiag", "[0.5x ACTIVE] First preview frame received, lens ${target.displayName} active")
                                     }
                                     isSwitchingLens.set(false)
                                 }
@@ -486,9 +619,19 @@ class CameraEngine(
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                    Log.e(TAG, "[CAMERA2_SESSION_ERROR] Session configuration failed on ${device.id}")
-                    isSwitchingLens.set(false)
-                    state.message = "Failed to configure Camera2 preview session"
+                    Log.w(TAG, "[CAMERA2_SESSION_ERROR] Stream combination failed for $comboDesc on ${device.id}")
+                    Log.w("LensDiag", "[0.5x RETRY] Stream combo $comboStage onConfigureFailed on Camera2 ID ${device.id}")
+                    if (configToken != camera2SessionGen.get()) return
+
+                    if (comboStage < 3) {
+                        val nextStage = comboStage + 1
+                        Log.i(TAG, "[CAMERA2] Retrying with progressive smaller stream combo: stage $nextStage")
+                        createCamera2Session(nextStage)
+                    } else {
+                        Log.e(TAG, "[CAMERA2_SESSION_ERROR] All 3 stream combinations failed on Camera2 ID ${device.id}")
+                        Log.e("LensDiag", "[0.5x FAILED] All stream combos failed on Camera2 ID ${device.id}, falling back to 1x")
+                        fallbackToCameraXMain("Ultra-wide session configuration failed, returned to 1x")
+                    }
                 }
 
                 override fun onClosed(session: CameraCaptureSession) {
@@ -498,12 +641,17 @@ class CameraEngine(
                 }
             }, camera2Handler)
         } catch (e: Exception) {
-            Log.e(TAG, "[CAMERA2_SESSION_ERROR] Exception creating capture session on ${device.id}", e)
-            isSwitchingLens.set(false)
+            Log.e(TAG, "[CAMERA2_SESSION_ERROR] Exception creating capture session for $comboDesc on ${device.id}", e)
+            if (comboStage < 3) {
+                createCamera2Session(comboStage + 1)
+            } else {
+                fallbackToCameraXMain("Failed to start ultra-wide session: ${e.message}, returned to 1x")
+            }
         }
     }
 
     private fun closeCamera2(keepTexture: Boolean = false) {
+        cancelCamera2Watchdog()
         camera2DeviceGen.incrementAndGet()
         camera2SessionGen.incrementAndGet()
         try { camera2Session?.stopRepeating() } catch (_: Throwable) {}
@@ -585,7 +733,34 @@ class CameraEngine(
     private fun camera2CaptureStill(toFile: File?, onResult: (Uri?, Throwable?) -> Unit) {
         val device = camera2Device ?: return onResult(null, IllegalStateException("Camera2 not open"))
         val session = camera2Session ?: return onResult(null, IllegalStateException("Camera2 session not configured"))
-        val jpegReader = camera2JpegReader ?: return onResult(null, IllegalStateException("JPEG reader not ready"))
+        val jpegReader = camera2JpegReader
+
+        if (jpegReader == null) {
+            Log.i(TAG, "[CAMERA2_STILL] JPEG reader not present; capturing frame from TextureView bitmap")
+            val tv = camera2TextureView
+            val bmp = tv?.bitmap
+            if (bmp != null) {
+                try {
+                    val baos = java.io.ByteArrayOutputStream()
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 95, baos)
+                    val bytes = baos.toByteArray()
+                    val uri = PhotoWriter.save(
+                        context = context,
+                        jpeg = bytes,
+                        name = MediaNaming.baseName(System.currentTimeMillis()),
+                        toFile = toFile
+                    )
+                    onResult(uri, null)
+                } catch (t: Throwable) {
+                    onResult(null, t)
+                } finally {
+                    bmp.recycle()
+                }
+                return
+            } else {
+                return onResult(null, IllegalStateException("Preview bitmap not available"))
+            }
+        }
 
         camera2PendingStillCapture = onResult
         camera2PendingStillFile = toFile
@@ -889,6 +1064,33 @@ class CameraEngine(
 
         zoomTransitionController.cancelTransition()
         zoomAnimator?.cancel()
+
+        val requestedBack = state.lensFacing == CameraSelector.LENS_FACING_BACK
+        val currentTarget = targetDiscoveredLens ?: activeDiscoveredLens
+        val activeRequiresCamera2 = requestedBack && currentTarget != null && (
+            currentTarget.isHiddenAux ||
+            (currentTarget.isIndependentCamera && currentTarget.cameraId != "0" && currentTarget.cameraId != "1") ||
+            (currentTarget.lensType == LensType.ULTRAWIDE && currentTarget.cameraId != "0")
+        )
+
+        if (activeRequiresCamera2) {
+            Log.i(TAG, "[LENS_SWITCH_REBIND] Target lens ${currentTarget.displayName} requires Camera2. Preserving/re-opening Camera2 instead of CameraX.")
+            camera?.cameraInfo?.zoomState?.removeObserver(zoomObserver)
+            provider.unbindAll()
+            camera = null
+            imageCapture = null
+            videoCapture = null
+            analysis = null
+            state.cameraReady = false
+            openCamera2(currentTarget)
+            return
+        } else {
+            if (isCamera2Active) {
+                Log.i(TAG, "[LENS_SWITCH_REBIND] Closing Camera2 before binding CameraX")
+                closeCamera2(keepTexture = false)
+            }
+        }
+
         camera?.cameraInfo?.zoomState?.removeObserver(zoomObserver)
         provider.unbindAll()
         camera = null
@@ -1038,9 +1240,8 @@ class CameraEngine(
         )
 
         zoomFactor = when {
-            usedPhysical != null -> caps.lensRatios[usedPhysical] ?: targetLens?.baseZoomRatio ?: 1f
-            targetLens != null && targetLens.lensType == LensType.ULTRAWIDE -> targetLens.baseZoomRatio
-            targetLens != null && targetLens.baseZoomRatio != 1f -> targetLens.baseZoomRatio
+            usedPhysical != null -> caps.lensRatios[usedPhysical] ?: 1f
+            targetCamId != null && boundCameraId == targetCamId -> targetLens?.baseZoomRatio ?: 1f
             else -> 1f
         }
 
@@ -1059,10 +1260,20 @@ class CameraEngine(
             matchingLenses.firstOrNull { it.physicalCameraId == usedPhysical || it.cameraId == usedPhysical }
         } else if (targetCamId != null && boundCameraId == targetCamId) {
             matchingLenses.firstOrNull { it.cameraId == targetCamId }
-        } else if (targetLens != null && (targetLens.cameraId == boundCameraId || targetLens.lensType == LensType.ULTRAWIDE)) {
-            targetLens
         } else {
-            matchingLenses.firstOrNull { it.isPrimaryMain } ?: matchingLenses.firstOrNull { it.lensType == LensType.WIDE } ?: matchingLenses.firstOrNull()
+            matchingLenses.firstOrNull { it.cameraId == boundCameraId && !it.isPhysical }
+                ?: matchingLenses.firstOrNull { it.isPrimaryMain }
+                ?: matchingLenses.firstOrNull { it.lensType == LensType.WIDE }
+                ?: matchingLenses.firstOrNull()
+        }
+
+        // Clamp desiredZoom to what the actually bound camera supports
+        val zs = cam.cameraInfo.zoomState.value
+        if (zs != null) {
+            val minZoom = zs.minZoomRatio * zoomFactor
+            val maxZoom = zs.maxZoomRatio * zoomFactor
+            desiredZoom = desiredZoom.coerceIn(minZoom, maxZoom)
+            state.zoom = desiredZoom
         }
 
         cam.cameraInfo.zoomState.observe(owner, zoomObserver)
@@ -1071,7 +1282,12 @@ class CameraEngine(
         applyZoom(desiredZoom)
         state.cameraReady = true
 
-        if (activeDiscoveredLens == null) {
+        if (targetLens != null && targetLens.lensType == LensType.ULTRAWIDE && newlyBoundLens?.lensType != LensType.ULTRAWIDE) {
+            Log.w(TAG, "[LENS_SWITCH] Ultra-wide selector requested but CameraX bound main camera. Resetting target lens.")
+            targetDiscoveredLens = null
+            activeDiscoveredLens = newlyBoundLens
+            isSwitchingLens.set(false)
+        } else {
             activeDiscoveredLens = newlyBoundLens
         }
 
@@ -1254,7 +1470,9 @@ class CameraEngine(
         }
 
         // Advanced Lens Detection ported from source ZIP
-        inventory = CameraDiscovery.discover(cameraManager)
+        if (inventory.lenses.isEmpty()) {
+            inventory = CameraDiscovery.discover(cameraManager)
+        }
         val discoveredBackLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
 
         // Physical lenses (only the back camera on Pixels has several).
@@ -1531,6 +1749,13 @@ class CameraEngine(
             (lens.physicalCameraId != boundPhysicalId) ||
             (lens.isIndependentCamera && lens.cameraId != boundCameraId)
 
+        if (lens.lensType == LensType.ULTRAWIDE || targetZoom < 0.95f) {
+            val chars = try { cameraManager?.getCameraCharacteristics(lens.cameraId) } catch (_: Throwable) { null }
+            val canUseLogical = CameraDiscovery.canUseLogicalZoomForLens(lens.cameraId, lens, targetZoom, chars)
+            val strat = if (canUseLogical) "LOGICAL_ZOOM" else CameraDiscovery.resolveSwitchStrategy(currentLens, lens).name
+            Log.i("LensDiag", "[0.5x REQUEST] selectDiscoveredLens: ${lens.displayName} (cameraId=${lens.cameraId}, physId=${lens.physicalCameraId}), Strategy: $strat, zoom=$targetZoom")
+        }
+
         if (isDifferentLens && !isRecording && !isBursting) {
             val chars = try { cameraManager?.getCameraCharacteristics(lens.cameraId) } catch (_: Throwable) { null }
             val canUseLogical = CameraDiscovery.canUseLogicalZoomForLens(lens.cameraId, lens, targetZoom, chars)
@@ -1571,6 +1796,11 @@ class CameraEngine(
             }.build()
             provider?.hasCamera(filter) == true
         }.getOrDefault(false)
+
+        if (isUw || targetZoom < 0.95f) {
+            val path = if (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0")) "Camera2" else "CameraX physical"
+            Log.i("LensDiag", "[0.5x REQUEST] switchCameraToLens: ${targetLens.displayName}, Strategy: $path (isHiddenAux=$isHiddenAux, cameraXHasCamera=$cameraXHasCamera)")
+        }
 
         // For hidden auxiliary lenses (e.g. vendor aux camera ID 2, 3, etc.) or when CameraX doesn't have the camera ID,
         // or for Ultra-Wide when on a separate camera ID:

@@ -50,7 +50,7 @@ class AppSettings(context: Context) {
     var manualLens by boolPref("manual_lens", false)
 
     // Lens & Zoom settings
-    var backgroundLensPreparation by boolPref("background_lens_prep", true)
+    var backgroundLensPreparation by boolPref("background_lens_prep", false)
     var instantLensSwitching by boolPref("instant_lens_switch", true)
     var autoLensSelection by boolPref("auto_lens_selection", false)
     var zoomTransitionAnimation by boolPref("zoom_transition_anim", true)

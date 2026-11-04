@@ -411,4 +411,38 @@ class PortedLensAndZoomSystemTest {
         assertTrue("Lens should be flagged as independent camera", hiddenAuxUw.isIndependentCamera)
         assertEquals("2", hiddenAuxUw.cameraId)
     }
+
+    @Test
+    fun testDeterministicLensInfoId() {
+        val lensA = LensInfo(
+            cameraId = "2",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.ULTRAWIDE,
+            displayName = "0.5x Ultra Wide",
+            focalLengthMm = 2.0f,
+            maxAperture = 2.2f,
+            physicalCameraId = null
+        )
+        val lensB = LensInfo(
+            cameraId = "2",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.ULTRAWIDE,
+            displayName = "0.5x Ultra Wide",
+            focalLengthMm = 2.0f,
+            maxAperture = 2.2f,
+            physicalCameraId = null
+        )
+        assertEquals("LensInfo IDs must be deterministic and identical for same lens", lensA.id, lensB.id)
+        assertEquals("2__ULTRAWIDE", lensA.id)
+
+        val mainLens = LensInfo(
+            cameraId = "0",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.WIDE,
+            displayName = "1x Main",
+            focalLengthMm = 5.0f,
+            maxAperture = 1.8f
+        )
+        assertTrue("Different lenses must have distinct deterministic IDs", lensA.id != mainLens.id)
+    }
 }

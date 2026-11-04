@@ -90,7 +90,7 @@ class BackgroundLensManager(
                     return DualStreamingMode.LOGICAL_MULTI_CAMERA_PHYSICAL
                 }
             }
-            return DualStreamingMode.PERSISTENT_DUAL_SESSION
+            return DualStreamingMode.NONE
         } else {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 try {
@@ -103,7 +103,7 @@ class BackgroundLensManager(
                     }
                 } catch (ignored: Throwable) {}
             }
-            return DualStreamingMode.PERSISTENT_DUAL_SESSION
+            return DualStreamingMode.NONE
         }
     }
 
@@ -116,9 +116,10 @@ class BackgroundLensManager(
         if (secondaryLens == null || cameraManager == null) return
 
         val dualMode = detectSimultaneousStreamingMode(mainLens, secondaryLens)
-        Log.i(TAG, "Preparing secondary lens ${secondaryLens.displayName} via dualMode=$dualMode")
+        Log.i(TAG, "[BACKGROUND_LENS] Preparing secondary lens ${secondaryLens.displayName} via dualMode=$dualMode")
 
-        if (dualMode == DualStreamingMode.NONE) {
+        if (dualMode != DualStreamingMode.CONCURRENT_DEVICES && dualMode != DualStreamingMode.LOGICAL_MULTI_CAMERA_PHYSICAL) {
+            Log.i(TAG, "[BACKGROUND_LENS] Dual streaming unsupported for ${secondaryLens.displayName}; standby camera disabled to prevent lockup")
             _status.value = BackgroundCameraStatus.UNAVAILABLE
             return
         }

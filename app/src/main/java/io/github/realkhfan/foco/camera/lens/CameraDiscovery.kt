@@ -65,6 +65,8 @@ object CameraDiscovery {
                 }
             }
 
+            logStartupDiagnostics(cameraManager, officialIds, candidateIds, ::getChars)
+
             val logicalToPhysical = mutableMapOf<String, Set<String>>()
             val physicalToLogical = mutableMapOf<String, String>()
 
@@ -481,5 +483,62 @@ object CameraDiscovery {
             }
         }
         return false
+    }
+
+    private var hasLoggedStartupDiag = false
+
+    private fun logStartupDiagnostics(
+        cameraManager: CameraManager,
+        officialIds: List<String>,
+        candidateIds: Set<String>,
+        getChars: (String) -> CameraCharacteristics?
+    ) {
+        if (hasLoggedStartupDiag) return
+        hasLoggedStartupDiag = true
+
+        val hiddenIds = candidateIds.filter { !officialIds.contains(it) }
+        val concurrent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching {
+                cameraManager.concurrentCameraIds.map { "[${it.joinToString(",")}]" }.joinToString()
+            }.getOrDefault("none")
+        } else "unsupported"
+
+        Log.i("LensDiag", "=== LensDiag STARTUP DIAGNOSTICS ===")
+        Log.i("LensDiag", "official cameraIdList: $officialIds")
+        Log.i("LensDiag", "probed hidden aux IDs: $hiddenIds")
+        Log.i("LensDiag", "concurrentCameraIds: $concurrent")
+
+        for (id in candidateIds) {
+            val chars = getChars(id) ?: continue
+            val facing = when (chars.get(CameraCharacteristics.LENS_FACING)) {
+                CameraCharacteristics.LENS_FACING_BACK -> "BACK"
+                CameraCharacteristics.LENS_FACING_FRONT -> "FRONT"
+                CameraCharacteristics.LENS_FACING_EXTERNAL -> "EXTERNAL"
+                else -> "UNKNOWN"
+            }
+            val hwLevel = when (chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "LIMITED"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "FULL"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "LEGACY"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_3 -> "LEVEL_3"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL -> "EXTERNAL"
+                else -> "UNKNOWN"
+            }
+            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
+            val focals = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList() ?: emptyList()
+            val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.let { "[${it.lower}, ${it.upper}]" } ?: "none"
+            } else "none"
+            val physIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                chars.physicalCameraIds
+            } else emptySet()
+
+            Log.i(
+                "LensDiag",
+                "Camera ID $id (hidden=${id in hiddenIds}): facing=$facing, hwLevel=$hwLevel, focals=$focals, sensorSize=$sensorSize, zoomRatioRange=$zoomRange, physIds=$physIds, caps=$caps"
+            )
+        }
+        Log.i("LensDiag", "=== LensDiag END ===")
     }
 }
