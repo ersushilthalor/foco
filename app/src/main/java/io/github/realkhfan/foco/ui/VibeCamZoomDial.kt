@@ -45,7 +45,11 @@ internal fun VibeCamZoomDial(
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
     val isPanorama = state.kind == CaptureKind.PHOTO && state.photoMode == PhotoMode.PANORAMA
-    val visible = state.cameraReady && snapshot != null && !isPanorama
+    val isAdjustable = state.cameraReady &&
+        state.minZoom.isFinite() && state.maxZoom.isFinite() &&
+        state.minZoom > 0f && state.maxZoom > state.minZoom &&
+        state.zoomChips.size > 1
+    val visible = isAdjustable && snapshot != null && !isPanorama
 
     LaunchedEffect(state.zoom) {
         expansion.onZoomChanged(zoomRatio = state.zoom)
