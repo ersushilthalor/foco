@@ -200,7 +200,10 @@ class CameraEngine(
                     ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
                 val switchZoom = CameraOpticalCalibration.switchPointToZoom(settings.switchPointMm)
                 val targetLens = if (zoom < switchZoom && ultraWideLens != null) ultraWideLens else (mainWideLens ?: activeDiscoveredLens)
-                if (targetLens != null && targetLens.lensType != activeDiscoveredLens?.lensType && !isSwitchingLens.get()) {
+                if (targetLens != null && isSwitchingLens.get()) {
+                    // Record the latest desired lens while keeping the zoom timeline running.
+                    selectDiscoveredLens(targetLens, zoom, isContinuous)
+                } else if (targetLens != null && targetLens.lensType != activeDiscoveredLens?.lensType) {
                     selectDiscoveredLens(targetLens, zoom, isContinuous)
                 } else {
                     applyZoomInternal(zoom, isContinuous)
@@ -448,7 +451,6 @@ class CameraEngine(
             LensDebugLog.log("fallbackToCameraXMain: $msg")
             cancelCamera2Watchdog()
             closeCamera2(keepTexture = false)
-            isSwitchingLens.set(false)
             targetDiscoveredLens = null
             val backLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
             val mainLens = backLenses.firstOrNull { it.isPrimaryMain }
@@ -456,6 +458,7 @@ class CameraEngine(
                 ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
                 ?: backLenses.firstOrNull()
             activeDiscoveredLens = mainLens
+            completeLensSwitch(mainLens)
             state.zoom = 1.0f
             desiredZoom = 1.0f
             zoomFactor = 1.0f
@@ -1353,7 +1356,9 @@ class CameraEngine(
         val view = previewView ?: return
         if (recording != null || burst != null || pano != null) return
 
-        zoomTransitionController.cancelTransition()
+        if (!isSwitchingLens.get()) {
+            zoomTransitionController.cancelTransition()
+        }
         zoomAnimator?.cancel()
 
         val requestedBack = state.lensFacing == CameraSelector.LENS_FACING_BACK
@@ -2132,21 +2137,18 @@ class CameraEngine(
                 Log.i(TAG, "[LENS_SWITCH] LOGICAL_ZOOM strategy active on currently bound device ${lens.cameraId} for ${lens.displayName} at zoom $targetZoom")
                 activeDiscoveredLens = lens
                 applyZoomInternal(targetZoom, isContinuous)
+                completeLensSwitch(lens, isContinuous)
             } else {
                 Log.i(TAG, "[LENS_SWITCH] Physical device handoff required for ${lens.displayName} (strategy=$strategy, activeCameraId=$activeDeviceCameraId, manualLens=${settings.manualLens})")
                 switchCameraToLens(lens, targetZoom)
             }
         } else {
             applyZoomInternal(targetZoom, isContinuous)
-            completeLensSwitch(currentLens)
+            completeLensSwitch(currentLens, isContinuous)
         }
     }
 
     fun switchCameraToLens(targetLens: LensInfo, targetZoom: Float) {
-        if (isSwitchingLens.get() && targetDiscoveredLens?.id == targetLens.id) {
-            LensDebugLog.log("switchCameraToLens ignored: switch to ${targetLens.displayName} (id=${targetLens.id}) already in flight")
-            return
-        }
         val currentLens = activeDiscoveredLens
         val strategy = CameraDiscovery.resolveSwitchStrategy(currentLens, targetLens)
         targetDiscoveredLens = targetLens
