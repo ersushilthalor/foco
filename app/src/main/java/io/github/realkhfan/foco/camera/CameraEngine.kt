@@ -321,10 +321,8 @@ class CameraEngine(
             }
             override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
                 original.onSurfaceTextureUpdated(surface)
-                val lens = targetDiscoveredLens ?: activeDiscoveredLens
-                val source = if (lens?.lensType == LensType.ULTRAWIDE)
-                    PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
-                onViewfinderFrameAvailable(source)
+                // CameraX always owns the main preview stream in this hybrid architecture.
+                onViewfinderFrameAvailable(PreviewStreamSource.MAIN)
             }
         }
         textureView.surfaceTextureListener = wrapper
@@ -387,18 +385,19 @@ class CameraEngine(
                 else activeSource == PreviewStreamSource.ULTRAWIDE
 
             mainView?.apply {
-                val mainVisible = overlapping || activeSource == PreviewStreamSource.MAIN
+                val mainVisible = activeSource == PreviewStreamSource.MAIN
                 alpha = if (overlapping) overlap.mainAlpha else if (mainVisible) 1f else 0f
                 translationZ = if (mainOnTop) 2f else if (overlapping) 1f else 0f
                 z = translationZ
-                visibility = if (mainVisible) android.view.View.VISIBLE else android.view.View.INVISIBLE
+                // Keep both TextureViews VISIBLE (including alpha=0) so standby buffers keep arriving.
+                visibility = android.view.View.VISIBLE
             }
             ultraWideView?.apply {
-                val ultraWideVisible = overlapping || activeSource == PreviewStreamSource.ULTRAWIDE
+                val ultraWideVisible = activeSource == PreviewStreamSource.ULTRAWIDE
                 alpha = if (overlapping) overlap.ultraWideAlpha else if (ultraWideVisible) 1f else 0f
                 translationZ = if (ultraWideOnTop) 2f else if (overlapping) 1f else 0f
                 z = translationZ
-                visibility = if (ultraWideVisible) android.view.View.VISIBLE else android.view.View.INVISIBLE
+                visibility = android.view.View.VISIBLE
             }
         }
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) applyState()
