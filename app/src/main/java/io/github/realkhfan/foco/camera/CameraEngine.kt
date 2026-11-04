@@ -335,7 +335,7 @@ class CameraEngine(
     fun onHostStart() {
         val currentTarget = targetDiscoveredLens ?: activeDiscoveredLens
         val requestedBack = state.lensFacing == CameraSelector.LENS_FACING_BACK
-        val activeRequiresCamera2 = requestedBack && currentTarget != null && (
+        val activeRequiresCamera2 = requestedBack && currentTarget != null && !currentTarget.isPrimaryMain && (
             currentTarget.isHiddenAux ||
             (currentTarget.isIndependentCamera && currentTarget.cameraId != "0" && currentTarget.cameraId != "1") ||
             (currentTarget.lensType == LensType.ULTRAWIDE && currentTarget.cameraId != "0")
@@ -1253,7 +1253,7 @@ class CameraEngine(
 
         val requestedBack = state.lensFacing == CameraSelector.LENS_FACING_BACK
         val currentTarget = targetDiscoveredLens ?: activeDiscoveredLens
-        val activeRequiresCamera2 = requestedBack && currentTarget != null && (
+        val activeRequiresCamera2 = requestedBack && currentTarget != null && !currentTarget.isPrimaryMain && (
             currentTarget.isHiddenAux ||
             (currentTarget.isIndependentCamera && currentTarget.cameraId != "0" && currentTarget.cameraId != "1") ||
             (currentTarget.lensType == LensType.ULTRAWIDE && currentTarget.cameraId != "0")
@@ -1325,7 +1325,7 @@ class CameraEngine(
 
         val targetCamId: String? = when {
             !isBack -> null
-            targetLens != null && targetLens.facing == CameraCharacteristics.LENS_FACING_BACK && targetLens.isIndependentCamera && targetLens.cameraId != "0" -> {
+            targetLens != null && !targetLens.isPrimaryMain && targetLens.facing == CameraCharacteristics.LENS_FACING_BACK && targetLens.isIndependentCamera && targetLens.cameraId != "0" -> {
                 targetLens.cameraId
             }
             else -> null
@@ -1965,15 +1965,28 @@ class CameraEngine(
 
         if (isDifferentLens && !isRecording && !isBursting) {
             val chars = try { cameraManager?.getCameraCharacteristics(lens.cameraId) } catch (_: Throwable) { null }
-            val canUseLogical = CameraDiscovery.canUseLogicalZoomForLens(lens.cameraId, lens, targetZoom, chars)
+            val supportsLogicalZoom = CameraDiscovery.canUseLogicalZoomForLens(lens.cameraId, lens, targetZoom, chars)
+            // A logical multi-camera can only service the handoff if THAT logical device is the
+            // device currently bound/open. Merely having logical-multicam characteristics on the
+            // target camera is not sufficient when the active stream is an independent aux ID.
+            val activeDeviceCameraId = when {
+                isCamera2Active -> camera2Device?.id
+                camera != null -> boundCameraId
+                else -> null
+            }
+            val canUseLogical = supportsLogicalZoom && activeDeviceCameraId == lens.cameraId
             val strategy = CameraDiscovery.resolveSwitchStrategy(currentLens, lens)
 
+            LensDebugLog.log(
+                "lens route decision: target=${lens.displayName}, targetCameraId=${lens.cameraId}, activeDeviceCameraId=$activeDeviceCameraId, logicalSupported=$supportsLogicalZoom, useLogical=$canUseLogical"
+            )
+
             if (canUseLogical) {
-                Log.i(TAG, "[LENS_SWITCH] LOGICAL_ZOOM strategy active for ${lens.displayName} at zoom $targetZoom")
+                Log.i(TAG, "[LENS_SWITCH] LOGICAL_ZOOM strategy active on currently bound device ${lens.cameraId} for ${lens.displayName} at zoom $targetZoom")
                 activeDiscoveredLens = lens
                 applyZoomInternal(targetZoom, isContinuous)
             } else {
-                Log.i(TAG, "[LENS_SWITCH] Switching to ${lens.displayName} (strategy=$strategy, manualLens=${settings.manualLens})")
+                Log.i(TAG, "[LENS_SWITCH] Physical device handoff required for ${lens.displayName} (strategy=$strategy, activeCameraId=$activeDeviceCameraId, manualLens=${settings.manualLens})")
                 switchCameraToLens(lens, targetZoom)
             }
         } else {
@@ -2005,6 +2018,8 @@ class CameraEngine(
 
         val isHiddenAux = targetLens.isHiddenAux || (targetLens.isIndependentCamera && targetLens.cameraId != "0" && targetLens.cameraId != "1")
         val isUw = targetLens.lensType == LensType.ULTRAWIDE
+        val isPrimaryMainCameraX = targetLens.isPrimaryMain ||
+            (targetLens.lensType == LensType.WIDE && !targetLens.isHiddenAux && !targetLens.isZoomPreset)
         val cameraXHasCamera = runCatching {
             val filter = CameraSelector.Builder().addCameraFilter { list ->
                 list.filter { runCatching { Camera2CameraInfo.from(it).cameraId == targetLens.cameraId }.getOrDefault(false) }
@@ -2020,7 +2035,7 @@ class CameraEngine(
         // For hidden auxiliary lenses (e.g. vendor aux camera ID 2, 3, etc.) or when CameraX doesn't have the camera ID,
         // or for Ultra-Wide when on a separate camera ID:
         // Use Camera2 API directly!
-        if (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0")) {
+        if (!isPrimaryMainCameraX && (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0"))) {
             Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
             val cam = camera
             if (cam != null) {
