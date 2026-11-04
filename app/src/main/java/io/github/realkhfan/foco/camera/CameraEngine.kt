@@ -379,14 +379,20 @@ class CameraEngine(
             val ultraWideOnTop = if (overlapping) overlap.topSource == PreviewStreamSource.ULTRAWIDE
                 else activeSource == PreviewStreamSource.ULTRAWIDE
             mainView?.apply {
-                alpha = if (overlapping) overlap.mainAlpha else if (activeSource == PreviewStreamSource.MAIN) 1f else 0f
-                translationZ = if (mainOnTop) 2f else 1f
-                visibility = android.view.View.VISIBLE
+                val mainVisible = overlapping || activeSource == PreviewStreamSource.MAIN
+                alpha = if (overlapping) overlap.mainAlpha else if (mainVisible) 1f else 0f
+                translationZ = if (mainOnTop) 2f else if (overlapping) 1f else 0f
+                z = translationZ
+                visibility = if (mainVisible) android.view.View.VISIBLE else android.view.View.INVISIBLE
+                if (mainOnTop) bringToFront()
             }
             ultraWideView?.apply {
-                alpha = if (overlapping) overlap.ultraWideAlpha else if (activeSource == PreviewStreamSource.ULTRAWIDE) 1f else 0f
-                translationZ = if (ultraWideOnTop) 2f else 1f
-                visibility = android.view.View.VISIBLE
+                val ultraWideVisible = overlapping || activeSource == PreviewStreamSource.ULTRAWIDE
+                alpha = if (overlapping) overlap.ultraWideAlpha else if (ultraWideVisible) 1f else 0f
+                translationZ = if (ultraWideOnTop) 2f else if (overlapping) 1f else 0f
+                z = translationZ
+                visibility = if (ultraWideVisible) android.view.View.VISIBLE else android.view.View.INVISIBLE
+                if (ultraWideOnTop) bringToFront()
             }
         }
     }
@@ -2019,9 +2025,12 @@ class CameraEngine(
                     pendingZoomUpdateTarget = finalZoom
                     val finalTarget = finalLens ?: targetLens
                     if (isSwitchingLens.get()) {
-                        // The physical frame callback owns switch completion; just coalesce final zoom.
-                        pendingZoomWhileSwitching = finalZoom
-                        if (finalTarget != null && targetDiscoveredLens?.id != finalTarget.id) {
+                        // The physical frame callback owns switch completion. Do not overwrite a
+                        // newer drag/tap request that was coalesced after this transition started.
+                        if (pendingZoomWhileSwitching == null) pendingZoomWhileSwitching = finalZoom
+                        if (pendingLensWhileSwitching == null && finalTarget != null &&
+                            targetDiscoveredLens?.id != finalTarget.id
+                        ) {
                             pendingLensWhileSwitching = finalTarget
                         }
                     } else if (finalTarget != null && finalTarget.id != activeDiscoveredLens?.id) {
@@ -2369,7 +2378,11 @@ class CameraEngine(
         configuredLens: LensInfo? = targetDiscoveredLens ?: activeDiscoveredLens,
         isContinuousTransition: Boolean = false
     ) {
-        if (configuredLens != null) activeDiscoveredLens = configuredLens
+        if (configuredLens != null) {
+            activeDiscoveredLens = configuredLens
+            _activePreviewSource.value = if (configuredLens.lensType == LensType.ULTRAWIDE)
+                PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+        }
         val nextLens = pendingLensWhileSwitching
         val nextZoom = pendingZoomWhileSwitching
         val nextIsContinuous = pendingIsContinuousTransitionWhileSwitching || isContinuousTransition
