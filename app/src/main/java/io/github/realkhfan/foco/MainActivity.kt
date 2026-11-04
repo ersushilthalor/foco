@@ -13,7 +13,7 @@ import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.view.TextureView
+import androidx.camera.view.PreviewView
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -225,13 +225,17 @@ open class MainActivity : ComponentActivity() {
                     FrameLayout(context).apply {
                         clipChildren = true
                         clipToPadding = true
-                        val cameraXMainPreview = TextureView(context).apply {
-                            layoutParams = FrameLayout.LayoutParams(
+                        val cameraXMainPreview = PreviewView(context).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                        }
+                        addView(
+                            cameraXMainPreview,
+                            FrameLayout.LayoutParams(
                                 FrameLayout.LayoutParams.MATCH_PARENT,
                                 FrameLayout.LayoutParams.MATCH_PARENT
                             )
-                        }
-                        addView(cameraXMainPreview)
+                        )
                         engine.previewView = cameraXMainPreview
                         engine.camera2PreviewHost = this
                     }
