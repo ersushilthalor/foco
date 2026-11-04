@@ -370,7 +370,7 @@ class CameraEngine(
         overlap: io.github.realkhfan.foco.camera.lens.PreviewOverlapState,
         activeSource: PreviewStreamSource
     ) {
-        mainHandler.post {
+        val applyState = {
             val mainView = previewView
             val ultraWideView = camera2TextureView
             val overlapping = overlap.isOverlapping
@@ -378,13 +378,13 @@ class CameraEngine(
                 else activeSource == PreviewStreamSource.MAIN
             val ultraWideOnTop = if (overlapping) overlap.topSource == PreviewStreamSource.ULTRAWIDE
                 else activeSource == PreviewStreamSource.ULTRAWIDE
+
             mainView?.apply {
                 val mainVisible = overlapping || activeSource == PreviewStreamSource.MAIN
                 alpha = if (overlapping) overlap.mainAlpha else if (mainVisible) 1f else 0f
                 translationZ = if (mainOnTop) 2f else if (overlapping) 1f else 0f
                 z = translationZ
                 visibility = if (mainVisible) android.view.View.VISIBLE else android.view.View.INVISIBLE
-                if (mainOnTop) bringToFront()
             }
             ultraWideView?.apply {
                 val ultraWideVisible = overlapping || activeSource == PreviewStreamSource.ULTRAWIDE
@@ -392,9 +392,10 @@ class CameraEngine(
                 translationZ = if (ultraWideOnTop) 2f else if (overlapping) 1f else 0f
                 z = translationZ
                 visibility = if (ultraWideVisible) android.view.View.VISIBLE else android.view.View.INVISIBLE
-                if (ultraWideOnTop) bringToFront()
             }
         }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) applyState()
+        else mainHandler.post { applyState() }
     }
 
     // ------------------------------------------------------------------ Camera2 Engine for Hidden / Auxiliary Lenses
