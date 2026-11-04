@@ -1,5 +1,8 @@
 package io.github.realkhfan.foco.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -33,6 +36,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -94,6 +98,8 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -219,16 +225,40 @@ private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: 
     val density = LocalDensity.current
     val swipeThreshold = with(density) { 70.dp.toPx() }
     val touchSlop = with(density) { 12.dp.toPx() }
+    val hasAdjustableZoom = state.cameraReady &&
+        state.minZoom.isFinite() && state.maxZoom.isFinite() &&
+        state.minZoom > 0f && state.maxZoom > state.minZoom
+    var zoomPanelVisible by remember { mutableStateOf(false) }
+    var zoomPanelRequest by remember { mutableStateOf(0) }
 
+    LaunchedEffect(zoomPanelRequest) {
+        if (zoomPanelRequest > 0) {
+            zoomPanelVisible = true
+            delay(2_000L)
+            zoomPanelVisible = false
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
     Box(
         Modifier
             .fillMaxSize()
             .onSizeChanged { size = it }
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = { if (state.review == null && !state.burstActive) actions.focusAt(it, size.width, size.height, lock = false) },
+                    onTap = {
+                        if (state.review == null && !state.burstActive) {
+                            actions.focusAt(it, size.width, size.height, lock = false)
+                            if (hasAdjustableZoom) zoomPanelRequest++
+                        }
+                    },
                     onDoubleTap = { actions.setZoom(if (state.zoom < 1.9f) 2f else 1f, fromChip = true) },
-                    onLongPress = { if (!state.burstActive) actions.focusAt(it, size.width, size.height, lock = true) },
+                    onLongPress = {
+                        if (!state.burstActive) {
+                            actions.focusAt(it, size.width, size.height, lock = true)
+                            if (hasAdjustableZoom) zoomPanelRequest++
+                        }
+                    },
                 )
             }
             .pointerInput(Unit) {
@@ -288,6 +318,44 @@ private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: 
             )
         }
     }
+
+    AnimatedVisibility(
+        visible = zoomPanelVisible && hasAdjustableZoom && !state.burstActive && state.review == null,
+        enter = fadeIn(tween(0)),
+        exit = fadeOut(tween(300)),
+        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 16.dp),
+    ) {
+        val zoomRange = state.maxZoom - state.minZoom
+        val linearZoom = ((state.zoom - state.minZoom) / zoomRange).coerceIn(0f, 1f)
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Image(
+                painter = painterResource(R.drawable.foco_vibecam_zoom_in),
+                contentDescription = null,
+                modifier = Modifier.padding(bottom = 10.dp).size(24.dp),
+            )
+            AndroidView(
+                factory = { context ->
+                    FocoZoomBar(context).apply {
+                        renderZoom(linearZoom, state.zoom) { linear ->
+                            actions.setZoom((state.minZoom + linear * zoomRange).coerceIn(state.minZoom, state.maxZoom))
+                        }
+                    }
+                },
+                modifier = Modifier.width(32.dp).height(250.dp),
+                update = { bar ->
+                    bar.renderZoom(linearZoom, state.zoom) { linear ->
+                        actions.setZoom((state.minZoom + linear * zoomRange).coerceIn(state.minZoom, state.maxZoom))
+                    }
+                },
+            )
+            Image(
+                painter = painterResource(R.drawable.foco_vibecam_zoom_out),
+                contentDescription = null,
+                modifier = Modifier.padding(top = 10.dp, bottom = 32.dp).size(24.dp),
+            )
+        }
+    }
+}
 }
 
 /** Swiping across the viewfinder walks through the photo modes: left = the mode on the right. */
@@ -842,8 +910,6 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
             when {
                 state.burstActive -> Unit
                 tool != null && state.proBarOpen -> ToolSlider(state, tool, actions, Modifier.padding(bottom = 4.dp))
-                state.zoomChips.size > 1 && !(state.kind == CaptureKind.PHOTO && state.photoMode == PhotoMode.PANORAMA) ->
-                    VibeCamZoomSlider(state, actions, iconRotation, Modifier)
             }
         }
         Spacer(Modifier.height(8.dp))
