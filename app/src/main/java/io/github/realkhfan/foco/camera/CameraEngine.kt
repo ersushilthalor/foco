@@ -321,7 +321,10 @@ class CameraEngine(
             }
             override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
                 original.onSurfaceTextureUpdated(surface)
-                onViewfinderFrameAvailable(PreviewStreamSource.MAIN)
+                val lens = targetDiscoveredLens ?: activeDiscoveredLens
+                val source = if (lens?.lensType == LensType.ULTRAWIDE)
+                    PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+                onViewfinderFrameAvailable(source)
             }
         }
         textureView.surfaceTextureListener = wrapper
@@ -333,7 +336,7 @@ class CameraEngine(
 
     private fun onViewfinderFrameAvailable(source: PreviewStreamSource) {
         val now = SystemClock.uptimeMillis()
-        val previousFrameAt = if (source == PreviewStreamSource.MAIN) lastMainPreviewFrameAtMs else lastUltraWidePreviewFrameAtMs
+        val previousFrameAt = if (source == PreviewStreamSource.MAIN) lastUltraWidePreviewFrameAtMs else lastMainPreviewFrameAtMs
         if (source == PreviewStreamSource.MAIN) lastMainPreviewFrameAtMs = now else lastUltraWidePreviewFrameAtMs = now
         backgroundLensManager.onPreviewFrameAvailable(source)
 
