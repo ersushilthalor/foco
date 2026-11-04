@@ -53,6 +53,8 @@ class BackgroundLensManager(
     @Volatile
     private var standbyCaptureSession: CameraCaptureSession? = null
     @Volatile
+    private var standbyRequestBuilder: CaptureRequest.Builder? = null
+    @Volatile
     private var standbySurface: Surface? = null
     @Volatile
     private var ownsStandbySurface = false
@@ -364,7 +366,10 @@ class BackgroundLensManager(
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-            }.also { applySynchronizedStandbySettings(it, lens) }
+            }.also {
+                standbyRequestBuilder = it
+                applySynchronizedStandbySettings(it, lens)
+            }
 
             @Suppress("DEPRECATION")
             camera.createCaptureSession(listOf(surf), object : CameraCaptureSession.StateCallback() {
@@ -402,6 +407,7 @@ class BackgroundLensManager(
                 override fun onClosed(session: CameraCaptureSession) {
                     if (standbyCaptureSession == session) {
                         standbyCaptureSession = null
+                        standbyRequestBuilder = null
                         isStreaming.set(false)
                         _status.value = BackgroundCameraStatus.OFF
                     }
@@ -424,6 +430,7 @@ class BackgroundLensManager(
         try { standbyCaptureSession?.stopRepeating() } catch (_: Throwable) {}
         try { standbyCaptureSession?.close() } catch (_: Throwable) {}
         standbyCaptureSession = null
+        standbyRequestBuilder = null
 
         try { standbyCameraDevice?.close() } catch (_: Throwable) {}
         standbyCameraDevice = null
