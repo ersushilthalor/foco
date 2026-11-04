@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -122,6 +123,7 @@ import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlinx.coroutines.delay
@@ -864,6 +866,12 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
 
 @Composable
 private fun ZoomChips(state: AppState, actions: CameraActions, iconRotation: Float, modifier: Modifier) {
+    var rulerOpen by remember { mutableStateOf(false) }
+    if (rulerOpen) {
+        ZoomRuler(state, actions, modifier, onCollapse = { rulerOpen = false })
+        return
+    }
+
     val chips = state.zoomChips
     val selected = ZoomMath.selectedIndex(chips, state.zoom)
     val primary = MaterialTheme.colorScheme.primary
@@ -873,12 +881,14 @@ private fun ZoomChips(state: AppState, actions: CameraActions, iconRotation: Flo
             .clip(CircleShape)
             .background(Color(0xB31E1F22))
             .pointerInput(Unit) {
-                detectHorizontalDragGestures { change, dragAmount ->
+                detectHorizontalDragGestures { change, _ ->
                     change.consume()
-                    actions.setZoom((state.zoom * exp(dragAmount / 260f)).coerceIn(state.minZoom, state.maxZoom))
+                    // A horizontal swipe expands the compact chips into the Pixel-style zoom ruler.
+                    rulerOpen = true
                 }
             }
-            .padding(4.dp),
+            .padding(4.dp)
+            .semantics { contentDescription = "Zoom controls. Swipe left or right to open the zoom slider." },
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -906,6 +916,128 @@ private fun ZoomChips(state: AppState, actions: CameraActions, iconRotation: Flo
             }
         }
     }
+}
+
+/** Expanded Pixel-style zoom ruler. Its range follows the camera's actual min/max zoom values. */
+@Composable
+private fun ZoomRuler(state: AppState, actions: CameraActions, modifier: Modifier, onCollapse: () -> Unit) {
+    val minZoom = state.minZoom.coerceAtLeast(0.01f)
+    val maxZoom = state.maxZoom.coerceAtLeast(minZoom)
+    val progress = zoomProgress(state.zoom, minZoom, maxZoom)
+
+    Column(
+        modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Box(
+            Modifier
+                .clip(RoundedCornerShape(22.dp))
+                .background(Color(0xFFEBD8F3))
+                .clickable(onClick = onCollapse)
+                .padding(horizontal = 17.dp, vertical = 6.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                ZoomMath.formatZoom(state.zoom),
+                color = Color(0xFF271B2D),
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+
+        BoxWithConstraints(
+            Modifier
+                .width(300.dp)
+                .height(62.dp)
+                .clip(RoundedCornerShape(30.dp))
+                .background(Color(0xB31E1F22))
+                .pointerInput(minZoom, maxZoom) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val trackWidth = size.width.toFloat().coerceAtLeast(1f)
+
+                        fun updateFromPosition(x: Float) {
+                            val fraction = (x / trackWidth).coerceIn(0f, 1f)
+                            val zoom = if (maxZoom > minZoom) {
+                                minZoom * exp(ln(maxZoom / minZoom) * fraction)
+                            } else {
+                                minZoom
+                            }
+                            actions.setZoom(zoom)
+                        }
+
+                        updateFromPosition(down.position.x)
+                        down.consume()
+                        do {
+                            val event = awaitPointerEvent()
+                            event.changes.forEach { pointer ->
+                                if (pointer.pressed) {
+                                    updateFromPosition(pointer.position.x)
+                                    pointer.consume()
+                                }
+                            }
+                        } while (event.changes.any { it.pressed })
+                    }
+                }
+                .semantics { contentDescription = "Zoom slider. Drag left or right to adjust zoom." },
+        ) {
+            Canvas(Modifier.fillMaxWidth().height(42.dp).align(Alignment.TopCenter)) {
+                val inset = 24.dp.toPx()
+                val left = inset
+                val right = (size.width - inset).coerceAtLeast(left)
+                val centerY = 20.dp.toPx()
+                val tickCount = 36
+                for (i in 0..tickCount) {
+                    val major = i % 6 == 0
+                    val medium = i % 3 == 0
+                    val tickHeight = when {
+                        major -> 17.dp.toPx()
+                        medium -> 12.dp.toPx()
+                        else -> 7.dp.toPx()
+                    }
+                    val x = left + (right - left) * i / tickCount
+                    drawLine(
+                        color = Color.White.copy(alpha = if (major) 0.85f else 0.55f),
+                        start = Offset(x, centerY - tickHeight / 2),
+                        end = Offset(x, centerY + tickHeight / 2),
+                        strokeWidth = if (major) 1.8.dp.toPx() else 1.2.dp.toPx(),
+                        cap = StrokeCap.Round,
+                    )
+                }
+                val thumbX = left + (right - left) * progress
+                drawRoundRect(
+                    color = Color(0xFFE9BFF2),
+                    topLeft = Offset(thumbX - 3.dp.toPx(), 7.dp.toPx()),
+                    size = Size(6.dp.toPx(), 26.dp.toPx()),
+                    cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
+                )
+            }
+
+            val labels = listOf(minZoom, 1f, 2f, 5f, 10f, maxZoom)
+                .filter { it >= minZoom && it <= maxZoom }
+                .distinct()
+            labels.forEach { value ->
+                val labelProgress = zoomProgress(value, minZoom, maxZoom)
+                Text(
+                    ZoomMath.formatZoom(value).removeSuffix("×"),
+                    color = Color.White.copy(alpha = 0.9f),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .offset(x = 24.dp + (maxWidth - 48.dp) * labelProgress - 10.dp)
+                        .padding(bottom = 5.dp),
+                )
+            }
+        }
+    }
+}
+
+private fun zoomProgress(zoom: Float, minZoom: Float, maxZoom: Float): Float {
+    if (maxZoom <= minZoom) return 0f
+    val safeZoom = zoom.coerceIn(minZoom, maxZoom)
+    return (ln(safeZoom / minZoom) / ln(maxZoom / minZoom)).coerceIn(0f, 1f)
 }
 
 @Composable
