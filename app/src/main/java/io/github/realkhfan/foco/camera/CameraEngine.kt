@@ -238,12 +238,12 @@ class CameraEngine(
 
     // ------------------------------------------------------------------ Camera2 Engine for Hidden / Auxiliary Lenses
     @Volatile private var isCamera2Active = false
-    private var camera2Device: CameraDevice? = null
-    private var camera2Session: CameraCaptureSession? = null
+    @Volatile private var camera2Device: CameraDevice? = null
+    @Volatile private var camera2Session: CameraCaptureSession? = null
     private var camera2RequestBuilder: CaptureRequest.Builder? = null
     private var camera2JpegReader: ImageReader? = null
     private var camera2YuvReader: ImageReader? = null
-    private var camera2Surface: Surface? = null
+    @Volatile private var camera2Surface: Surface? = null
     private var camera2TextureView: TextureView? = null
     private val camera2Thread = HandlerThread("foco-camera2").apply { start() }
     private val camera2Handler = Handler(camera2Thread.looper)
@@ -257,6 +257,7 @@ class CameraEngine(
 
     private enum class Camera2WatchdogStage {
         OPEN,
+        SURFACE,
         CONFIGURE,
         FIRST_FRAME
     }
@@ -270,6 +271,7 @@ class CameraEngine(
             if (isCamera2Active && !firstTargetFrameArrived) {
                 val stageName = when (stage) {
                     Camera2WatchdogStage.OPEN -> "open"
+                    Camera2WatchdogStage.SURFACE -> "preview surface"
                     Camera2WatchdogStage.CONFIGURE -> "configure (combo $camera2ComboStage)"
                     Camera2WatchdogStage.FIRST_FRAME -> "first frame"
                 }
@@ -368,16 +370,24 @@ class CameraEngine(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
-            visibility = android.view.View.GONE
+            // Keep the TextureView attached and its SurfaceTexture allocated even while CameraX is active.
+            // GONE can prevent TextureView from creating a SurfaceTexture until after CameraDevice has opened.
+            visibility = android.view.View.VISIBLE
+            alpha = 0f
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
                     LensDebugLog.log("TextureView available: ${width}x${height}")
+                    st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
                     camera2Surface?.release()
                     camera2Surface = Surface(st)
-                    st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
                     updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
                     if (isCamera2Active && camera2Device != null && camera2Session == null) {
-                        createCamera2Session(comboStage = 1)
+                        mainHandler.post {
+                            if (isCamera2Active && camera2Device != null && camera2Session == null) {
+                                cancelCamera2Watchdog()
+                                createCamera2Session(comboStage = 1)
+                            }
+                        }
                     }
                 }
 
@@ -391,6 +401,13 @@ class CameraEngine(
                     LensDebugLog.log("TextureView destroyed")
                     camera2Surface?.release()
                     camera2Surface = null
+                    val oldSession = camera2Session
+                    camera2Session = null
+                    camera2SessionGen.incrementAndGet()
+                    try { oldSession?.close() } catch (_: Throwable) {}
+                    if (isCamera2Active && camera2Device != null) {
+                        startCamera2Watchdog(Camera2WatchdogStage.SURFACE, 8000L)
+                    }
                     return true
                 }
 
@@ -420,6 +437,24 @@ class CameraEngine(
         view.addView(tv)
     }
 
+    /**
+     * Returns a live preview Surface, recreating the lightweight Surface wrapper when TextureView
+     * has been re-created by Android. Must be called on the main thread because it reads View state.
+     */
+    private fun resolveCamera2PreviewSurface(): Surface? {
+        val textureView = camera2TextureView ?: return null
+        camera2Surface?.takeIf { it.isValid }?.let { return it }
+        if (!textureView.isAttachedToWindow || !textureView.isAvailable) return null
+        val texture = textureView.surfaceTexture ?: return null
+        return try {
+            texture.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
+            Surface(texture).also { camera2Surface = it }
+        } catch (t: Throwable) {
+            LensDebugLog.log("resolveCamera2PreviewSurface failed: ${t.message}")
+            null
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun openCamera2(lens: LensInfo) {
         val mgr = cameraManager ?: run {
@@ -431,17 +466,23 @@ class CameraEngine(
 
         LensDebugLog.log("openCamera2 called for ${lens.displayName} (cameraId=${lens.cameraId}, surface=${if (camera2Surface != null) "ready" else "null"})")
 
-        // Release standby camera before opening Camera2 to avoid hardware concurrency limits
+        // Release standby camera before opening Camera2 to avoid hardware concurrency limits.
+        // Reveal the already-attached TextureView before opening the device so its Surface is ready
+        // by the time onOpened arrives; do not rely on a later post to make a GONE view allocate it.
         backgroundLensManager.release()
         closeCamera2(keepTexture = true)
+        previewView?.let { ensureCamera2TextureView(it) }
+        camera2TextureView?.apply {
+            visibility = android.view.View.VISIBLE
+            alpha = 1f
+            bringToFront()
+            requestLayout()
+            invalidate()
+        }
 
         isCamera2Active = true
         firstTargetFrameArrived = false
         startCamera2Watchdog(Camera2WatchdogStage.OPEN, 4000L)
-
-        mainHandler.post {
-            camera2TextureView?.visibility = android.view.View.VISIBLE
-        }
 
         val openToken = camera2DeviceGen.incrementAndGet()
         Log.i(TAG, "[CAMERA2_OPEN] Opening Camera2 device ID ${lens.cameraId} (${lens.displayName}, isHiddenAux=${lens.isHiddenAux})")
@@ -458,7 +499,25 @@ class CameraEngine(
                     boundCameraId = device.id
                     boundPhysicalId = lens.physicalCameraId
                     Log.i(TAG, "[CAMERA2_OPENED] Camera2 device ID ${device.id} opened successfully")
-                    createCamera2Session(comboStage = 1)
+                    mainHandler.post {
+                        if (openToken != camera2DeviceGen.get() || !isCamera2Active) return@post
+                        // The OPEN watchdog has done its job. Surface creation is a separate lifecycle
+                        // stage and must not be reported as a camera-open timeout.
+                        cancelCamera2Watchdog()
+                        if (resolveCamera2PreviewSurface() == null) {
+                            LensDebugLog.log("CameraDevice opened; waiting for TextureView SurfaceTexture")
+                            startCamera2Watchdog(Camera2WatchdogStage.SURFACE, 8000L)
+                            camera2TextureView?.apply {
+                                visibility = android.view.View.VISIBLE
+                                alpha = 1f
+                                requestLayout()
+                                invalidate()
+                            }
+                        } else {
+                            LensDebugLog.log("CameraDevice opened with preview Surface ready")
+                            createCamera2Session(comboStage = 1)
+                        }
+                    }
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
@@ -499,15 +558,24 @@ class CameraEngine(
 
     private fun createCamera2Session(comboStage: Int = 1) {
         val device = camera2Device ?: return
-        val surf = camera2Surface
+        val surf = resolveCamera2PreviewSurface()
         val lens = targetDiscoveredLens ?: activeDiscoveredLens ?: return
         val configToken = camera2SessionGen.incrementAndGet()
         camera2ComboStage = comboStage
 
-        LensDebugLog.log("createCamera2Session: comboStage=$comboStage, camera2Surface=${if (surf != null) "valid" else "null"}")
+        LensDebugLog.log("createCamera2Session: comboStage=$comboStage, camera2Surface=${if (surf?.isValid == true) "valid" else "null/invalid"}")
 
-        if (surf == null) {
-            LensDebugLog.log("createCamera2Session postponed: camera2Surface is null, waiting for TextureView")
+        if (surf == null || !surf.isValid) {
+            LensDebugLog.log("createCamera2Session postponed: TextureView SurfaceTexture is not ready")
+            startCamera2Watchdog(Camera2WatchdogStage.SURFACE, 8000L)
+            mainHandler.post {
+                camera2TextureView?.apply {
+                    visibility = android.view.View.VISIBLE
+                    alpha = 1f
+                    requestLayout()
+                    invalidate()
+                }
+            }
             return
         }
 
@@ -743,10 +811,10 @@ class CameraEngine(
 
         isCamera2Active = false
         if (!keepTexture) {
-            camera2Surface?.release()
-            camera2Surface = null
+            // Keep TextureView attached so Android retains its SurfaceTexture for the next switch.
+            // Alpha hides its content without destroying the preview surface (GONE can destroy it).
             mainHandler.post {
-                camera2TextureView?.visibility = android.view.View.GONE
+                camera2TextureView?.alpha = 0f
             }
         }
     }
@@ -1104,6 +1172,12 @@ class CameraEngine(
 
     fun release() {
         closeCamera2()
+        camera2Surface?.release()
+        camera2Surface = null
+        camera2TextureView?.let { textureView ->
+            (textureView.parent as? android.view.ViewGroup)?.removeView(textureView)
+        }
+        camera2TextureView = null
         try { camera2Thread.quitSafely() } catch (_: Throwable) {}
         zoomTransitionController.cancelTransition()
         backgroundLensManager.release()
