@@ -73,6 +73,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCase
 import androidx.camera.core.ZoomState
@@ -90,7 +93,7 @@ import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
-import androidx.camera.view.PreviewView
+import androidx.camera.core.SurfaceRequest
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.Observer
@@ -237,15 +240,138 @@ class CameraEngine(
             if (value != null) ensureCamera2TextureView(value)
         }
 
-    var previewView: PreviewView? = null
+    private var pendingMainSurfaceRequest: SurfaceRequest? = null
+    @Volatile private var mainPreviewSurface: Surface? = null
+    private var lastMainPreviewFrameAtMs = 0L
+    private var lastUltraWidePreviewFrameAtMs = 0L
+    private var lensSwitchRequestedAtMs = 0L
+    private var crossfadeStartLogged = false
+
+    private val _activePreviewSource = MutableStateFlow(PreviewStreamSource.MAIN)
+    val activePreviewSource: StateFlow<PreviewStreamSource> = _activePreviewSource.asStateFlow()
+
+    private val cameraXMainSurfaceProvider = Preview.SurfaceProvider { request ->
+        mainHandler.post { provideMainPreviewSurface(request) }
+    }
+
+    var previewView: TextureView? = null
         set(value) {
             field = value
             if (value != null) {
+                value.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                        pendingMainSurfaceRequest?.let { request ->
+                            pendingMainSurfaceRequest = null
+                            provideMainPreviewSurface(request)
+                        }
+                        if (provider != null && camera == null && !isCamera2Active) {
+                            mainHandler.post { rebind() }
+                        }
+                    }
+                    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
+                    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                        pendingMainSurfaceRequest?.willNotProvideSurface()
+                        pendingMainSurfaceRequest = null
+                        return true
+                    }
+                    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+                        onViewfinderFrameAvailable(PreviewStreamSource.MAIN)
+                    }
+                }
                 val host = camera2PreviewHost ?: (value.parent as? FrameLayout)
                 host?.let { ensureCamera2TextureView(it) }
+                if (value.isAvailable) {
+                    pendingMainSurfaceRequest?.let { request ->
+                        pendingMainSurfaceRequest = null
+                        provideMainPreviewSurface(request)
+                    }
+                }
                 if (provider != null && camera == null && !isCamera2Active) rebind()
             }
         }
+
+    private fun provideMainPreviewSurface(request: SurfaceRequest) {
+        val textureView = previewView
+        val texture = textureView?.takeIf { it.isAvailable }?.surfaceTexture
+        if (texture == null) {
+            pendingMainSurfaceRequest?.willNotProvideSurface()
+            pendingMainSurfaceRequest = request
+            return
+        }
+        try {
+            val resolution = request.resolution
+            texture.setDefaultBufferSize(resolution.width, resolution.height)
+            val surface = Surface(texture)
+            mainPreviewSurface = surface
+            request.provideSurface(surface, mainExecutor) {
+                if (mainPreviewSurface === surface) mainPreviewSurface = null
+                runCatching { surface.release() }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Unable to provide CameraX main TextureView surface", t)
+            request.willNotProvideSurface()
+        }
+    }
+
+    private fun onViewfinderFrameAvailable(source: PreviewStreamSource) {
+        val now = SystemClock.uptimeMillis()
+        val previousFrameAt = if (source == PreviewStreamSource.MAIN) lastMainPreviewFrameAtMs else lastUltraWidePreviewFrameAtMs
+        if (source == PreviewStreamSource.MAIN) lastMainPreviewFrameAtMs = now else lastUltraWidePreviewFrameAtMs = now
+
+        val target = targetDiscoveredLens
+        val expectedSource = if (target?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+        if (isSwitchingLens.get() && target != null && source == expectedSource) {
+            val elapsed = if (lensSwitchRequestedAtMs > 0L) (now - lensSwitchRequestedAtMs).coerceAtLeast(0L) else -1L
+            firstTargetFrameArrived = true
+            cancelCamera2Watchdog()
+            activeDiscoveredLens = target
+            targetDiscoveredLens = null
+            _activePreviewSource.value = source
+            Log.i(TAG, "[LENS_SWITCH_LATENCY] tapToFirstFreshTargetFrameMs=$elapsed target=${target.displayName} source=$source")
+            Log.i(TAG, "[LENS_SWITCH_SUCCESS] First fresh viewfinder buffer displayed for ${target.displayName}")
+            LensDebugLog.log("first fresh viewfinder buffer arrived for ${target.displayName} after ${elapsed}ms")
+            isSwitchingLens.set(false)
+        }
+
+        val overlapBefore = zoomTransitionController.previewOverlapState.value
+        if (overlapBefore.isOverlapping && !crossfadeStartLogged) {
+            val age = if (previousFrameAt > 0L) (now - previousFrameAt).coerceAtLeast(0L) else -1L
+            Log.i(TAG, "[LENS_CROSSFADE] source=$source previousBufferAgeMs=$age; standbyReady=${backgroundLensManager.isStandbyReady()}")
+            crossfadeStartLogged = true
+        } else if (!overlapBefore.isOverlapping) {
+            crossfadeStartLogged = false
+        }
+
+        val wasOverlapping = overlapBefore.isOverlapping
+        zoomTransitionController.onPreviewFrameAvailable(source)
+        val isOverlappingNow = zoomTransitionController.previewOverlapState.value.isOverlapping
+        if (wasOverlapping && !isOverlappingNow) backgroundLensManager.syncStandbyStreamSettings()
+    }
+
+    fun updatePreviewOverlapState(
+        overlap: io.github.realkhfan.foco.camera.lens.PreviewOverlapState,
+        activeSource: PreviewStreamSource
+    ) {
+        mainHandler.post {
+            val mainView = previewView
+            val ultraWideView = camera2TextureView
+            val overlapping = overlap.isOverlapping
+            val mainOnTop = if (overlapping) overlap.topSource == PreviewStreamSource.MAIN
+                else activeSource == PreviewStreamSource.MAIN
+            val ultraWideOnTop = if (overlapping) overlap.topSource == PreviewStreamSource.ULTRAWIDE
+                else activeSource == PreviewStreamSource.ULTRAWIDE
+            mainView?.apply {
+                alpha = if (overlapping) overlap.mainAlpha else if (activeSource == PreviewStreamSource.MAIN) 1f else 0f
+                translationZ = if (mainOnTop) 2f else 1f
+                visibility = android.view.View.VISIBLE
+            }
+            ultraWideView?.apply {
+                alpha = if (overlapping) overlap.ultraWideAlpha else if (activeSource == PreviewStreamSource.ULTRAWIDE) 1f else 0f
+                translationZ = if (ultraWideOnTop) 2f else 1f
+                visibility = android.view.View.VISIBLE
+            }
+        }
+    }
 
     // ------------------------------------------------------------------ Camera2 Engine for Hidden / Auxiliary Lenses
     @Volatile private var isCamera2Active = false
@@ -441,24 +567,9 @@ class CameraEngine(
                 }
 
                 override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
-                    if (!firstTargetFrameArrived) {
-                        firstTargetFrameArrived = true
-                        cancelCamera2Watchdog()
-                        LensDebugLog.log("first onSurfaceTextureUpdated arrived (watchdog cancelled)")
-                    }
-                    if (isSwitchingLens.get()) {
-                        val target = targetDiscoveredLens
-                        if (target != null) {
-                            activeDiscoveredLens = target
-                            targetDiscoveredLens = null
-                            Log.i(TAG, "[CAMERA2_LENS_FRAME] First valid target preview frame arrived on Camera2 ID ${camera2Device?.id} (${target.displayName})")
-                            Log.i(TAG, "[LENS_SWITCH_SUCCESS] Switching successfully completed to ${target.displayName} at zoom ${state.zoom}")
-                            LensDebugLog.log("lens switch completed to ${target.displayName}")
-                        }
-                        isSwitchingLens.set(false)
-                    }
-                    val source = if (activeDiscoveredLens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
-                    zoomTransitionController.onPreviewFrameAvailable(source)
+                    val lens = targetDiscoveredLens ?: activeDiscoveredLens
+                    val source = if (lens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+                    onViewfinderFrameAvailable(source)
                 }
             }
         }
@@ -755,8 +866,7 @@ class CameraEngine(
                                     }
                                     isSwitchingLens.set(false)
                                 }
-                                val source = if (activeDiscoveredLens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
-                                zoomTransitionController.onPreviewFrameAvailable(source)
+                                // Fresh preview frames are reported by TextureView.onSurfaceTextureUpdated.
 
                                 val now = SystemClock.uptimeMillis()
                                 if (now - lastReadoutMs < 250) return
@@ -1082,8 +1192,7 @@ class CameraEngine(
                 }
                 isSwitchingLens.set(false)
             }
-            val activeSource = if (activeDiscoveredLens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
-            zoomTransitionController.onPreviewFrameAvailable(activeSource)
+            // Fresh preview frames are reported by the main/Ultra-Wide TextureView listeners.
 
             val now = SystemClock.uptimeMillis()
             if (now - lastReadoutMs < 250) return
@@ -1480,6 +1589,7 @@ class CameraEngine(
             isSwitchingLens.set(false)
         } else {
             activeDiscoveredLens = newlyBoundLens
+            _activePreviewSource.value = if (newlyBoundLens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
             if (targetDiscoveredLens?.id == targetLens?.id) {
                 targetDiscoveredLens = null
             }
@@ -1496,7 +1606,7 @@ class CameraEngine(
         }
     }
 
-    private fun buildUseCases(view: PreviewView, caps: Capabilities, setup: Setup, physicalCameraId: String? = boundPhysicalId): List<UseCase> {
+    private fun buildUseCases(view: TextureView, caps: Capabilities, setup: Setup, physicalCameraId: String? = boundPhysicalId): List<UseCase> {
         val isVideo = state.kind == CaptureKind.VIDEO
         val ratio = if (isVideo || settings.ratio == RatioSetting.WIDE_9_16) AspectRatio.RATIO_16_9 else AspectRatio.RATIO_4_3
         val aspect = AspectRatioStrategy(ratio, AspectRatioStrategy.FALLBACK_RULE_AUTO)
@@ -1507,7 +1617,7 @@ class CameraEngine(
             Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(physicalCameraId)
         }
         Camera2Interop.Extender(previewBuilder).setSessionCaptureCallback(captureCallback)
-        val preview = previewBuilder.build().also { it.setSurfaceProvider(view.surfaceProvider) }
+        val preview = previewBuilder.build().also { it.setSurfaceProvider(cameraXMainSurfaceProvider) }
         val cases = mutableListOf<UseCase>(preview)
         imageCapture = null
         videoCapture = null
@@ -2003,6 +2113,7 @@ class CameraEngine(
         val strategy = CameraDiscovery.resolveSwitchStrategy(currentLens, targetLens)
         targetDiscoveredLens = targetLens
         desiredZoom = targetZoom
+        lensSwitchRequestedAtMs = SystemClock.uptimeMillis()
         isSwitchingLens.set(true)
         firstTargetFrameArrived = false
         val switchGen = lensSwitchGeneration.incrementAndGet()
