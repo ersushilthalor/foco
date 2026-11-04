@@ -89,7 +89,6 @@ internal fun VibeCamZoomDial(
                             onExpand = expansion::expand,
                             onStopClick = { stop ->
                                 expansion.onStopClicked(zoomRatio = stop)
-                                actions.haptic()
                                 actions.setZoom(stop, fromChip = true)
                             },
                             expandLabel = "Adjust zoom",
