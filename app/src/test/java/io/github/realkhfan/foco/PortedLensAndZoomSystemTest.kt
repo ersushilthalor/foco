@@ -445,4 +445,91 @@ class PortedLensAndZoomSystemTest {
         )
         assertTrue("Different lenses must have distinct deterministic IDs", lensA.id != mainLens.id)
     }
+
+    @Test
+    fun testStandbyCropFovMatching() {
+        val mainLens = LensInfo(
+            cameraId = "0",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.WIDE,
+            displayName = "1x Main",
+            focalLengthMm = 5.0f,
+            maxAperture = 1.8f,
+            equivalent35mmFocalMm = 24.0f,
+            isPrimaryMain = true
+        )
+        val uwLens = LensInfo(
+            cameraId = "2",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.ULTRAWIDE,
+            displayName = "0.5x Ultra Wide",
+            focalLengthMm = 2.0f,
+            maxAperture = 2.2f,
+            equivalent35mmFocalMm = 13.0f,
+            baseZoomRatio = 0.5f
+        )
+        val lenses = listOf(mainLens, uwLens)
+
+        // Idle standby crop on Ultra-Wide must match 1x Main FOV (~1.85x digital crop on 13mm to match 24mm)
+        val standbyCropAtIdle = CameraOpticalCalibration.calculateFovMatchedUltraWideCrop(
+            switchPointMm = CameraOpticalCalibration.DEFAULT_SWITCH_POINT_MM,
+            mainEquivalentFocalMm = 24.0f,
+            uwEquivalentFocalMm = 13.0f
+        )
+        assertTrue("Standby crop at idle should be ~1.85x", standbyCropAtIdle in 1.80f..1.90f)
+
+        // During live handoff, standby crop follows the UI zoom so views don't diverge
+        val cropAtHandoffZoom = CameraOpticalCalibration.calculateRequiredDigitalCrop(
+            uiZoom = 1.5f,
+            lensBaseRatio = 0.5f,
+            lensType = LensType.ULTRAWIDE,
+            uwEquivalentFocalMm = 13.0f,
+            mainEquivalentFocalMm = 24.0f,
+            switchPointMm = CameraOpticalCalibration.DEFAULT_SWITCH_POINT_MM
+        )
+        assertTrue("Standby crop during 1.5x handoff should scale proportionately", cropAtHandoffZoom > standbyCropAtIdle)
+    }
+
+    @Test
+    fun testFrameHandoffSmoothCubicStepProgression() {
+        var prevProgress = 0f
+        for (frameCount in 1..16) {
+            val progress = ZoomTransitionController.calculateFrameHandoffProgress(
+                incomingFrameCount = frameCount,
+                targetSource = PreviewStreamSource.MAIN,
+                currentZoom = 1.0f,
+                previousProgress = prevProgress
+            )
+            assertTrue("Progress must increase monotonically with each frame", progress >= prevProgress)
+            assertTrue("Per-frame alpha step must not exceed MAX_HANDOFF_ALPHA_STEP", progress - prevProgress <= 0.301f)
+            prevProgress = progress
+        }
+        assertEquals(1.0f, prevProgress, 0.001f)
+    }
+
+    @Test
+    fun testTransitionTimingDurations() {
+        assertEquals(400L, ZoomTransitionController.TOTAL_TRANSITION_DURATION_MS)
+        assertEquals(300L, ZoomTransitionController.VIDEO_TRANSITION_DURATION_MS)
+        assertEquals(200L, ZoomTransitionController.DEFAULT_HOLD_AT_ONE_X_DURATION_MS)
+        assertEquals(16L, ZoomTransitionController.ZOOM_UPDATE_INTERVAL_MS)
+
+        // Direct 0.5x -> 1x keeps full 300ms motion duration and adds 200ms hold
+        val directHalfXToOneXMotionDuration = ZoomTransitionController.calculateTransitionMotionDurationMs(
+            durationMs = 300L,
+            holdDurationMs = 200L,
+            isUltraWideToMainSwitch = true,
+            isDirectHalfXToOneXHold = true
+        )
+        assertEquals(300L, directHalfXToOneXMotionDuration)
+
+        // Non-direct switch deducts hold duration so total time equals requested duration
+        val nonDirectMotionDuration = ZoomTransitionController.calculateTransitionMotionDurationMs(
+            durationMs = 300L,
+            holdDurationMs = 200L,
+            isUltraWideToMainSwitch = true,
+            isDirectHalfXToOneXHold = false
+        )
+        assertEquals(100L, nonDirectMotionDuration)
+    }
 }

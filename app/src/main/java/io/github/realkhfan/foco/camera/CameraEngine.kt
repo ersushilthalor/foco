@@ -70,6 +70,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -247,15 +248,21 @@ class CameraEngine(
             }
         }
 
+    val isUsingUltraWideSurface = MutableStateFlow(false)
+    var ultraWideTextureView: TextureView? = null
+        private set
+
     // ------------------------------------------------------------------ Camera2 Engine for Hidden / Auxiliary Lenses
-    @Volatile private var isCamera2Active = false
+    @Volatile var isCamera2Active = false
+        private set
     @Volatile private var camera2Device: CameraDevice? = null
     @Volatile private var camera2Session: CameraCaptureSession? = null
     private var camera2RequestBuilder: CaptureRequest.Builder? = null
     private var camera2JpegReader: ImageReader? = null
     private var camera2YuvReader: ImageReader? = null
     @Volatile private var camera2Surface: Surface? = null
-    private var camera2TextureView: TextureView? = null
+    var camera2TextureView: TextureView? = null
+        private set
     private val camera2Thread = HandlerThread("foco-camera2").apply { start() }
     private val camera2Handler = Handler(camera2Thread.looper)
     private var camera2DeviceGen = java.util.concurrent.atomic.AtomicInteger(0)
@@ -349,8 +356,14 @@ class CameraEngine(
         }
     }
 
-    private fun updateCamera2TextureTransform(viewWidth: Int, viewHeight: Int, previewWidth: Int, previewHeight: Int) {
-        val tv = camera2TextureView ?: return
+    fun updateCamera2TextureTransform(
+        viewWidth: Int,
+        viewHeight: Int,
+        previewWidth: Int,
+        previewHeight: Int,
+        targetView: TextureView? = null
+    ) {
+        val tv = targetView ?: camera2TextureView ?: return
         if (viewWidth <= 0 || viewHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) return
         val matrix = Matrix()
         val centerX = viewWidth / 2f
@@ -406,6 +419,7 @@ class CameraEngine(
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
                     LensDebugLog.log("TextureView available: ${width}x${height}")
                     st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
+                    backgroundLensManager.setMainSurfaceTexture(st, width, height)
                     camera2Surface?.release()
                     camera2Surface = Surface(st)
                     updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
@@ -422,11 +436,13 @@ class CameraEngine(
                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
                     LensDebugLog.log("TextureView size changed: ${width}x${height}")
                     st.setDefaultBufferSize(camera2PreviewSize.width, camera2PreviewSize.height)
+                    backgroundLensManager.setMainSurfaceTexture(st, width, height)
                     updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height)
                 }
 
                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                     LensDebugLog.log("TextureView destroyed")
+                    backgroundLensManager.setMainSurfaceTexture(null, 0, 0)
                     camera2Surface?.release()
                     camera2Surface = null
                     val oldSession = camera2Session
@@ -457,14 +473,61 @@ class CameraEngine(
                         }
                         isSwitchingLens.set(false)
                     }
-                    val source = if (activeDiscoveredLens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
-                    zoomTransitionController.onPreviewFrameAvailable(source)
+                    val source = if (isUsingUltraWideSurface.value || activeDiscoveredLens?.lensType == LensType.ULTRAWIDE) {
+                        PreviewStreamSource.ULTRAWIDE
+                    } else {
+                        PreviewStreamSource.MAIN
+                    }
+                    onPreviewFrameAvailable(source)
                 }
             }
         }
         camera2TextureView = tv
         // This is a sibling overlay in the stable host, never a child of PreviewView.
         host.addView(tv)
+    }
+
+    fun setUltraWidePreviewTextureView(tv: TextureView) {
+        ultraWideTextureView = tv
+        tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                backgroundLensManager.setUltraWideSurfaceTexture(st, width, height)
+                updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height, tv)
+                if (settings.backgroundLensPreparation) {
+                    val backLenses = inventory.lenses.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
+                    val mainLens = backLenses.firstOrNull { it.isPrimaryMain } ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
+                    val secondaryLens = backLenses.firstOrNull { it.lensType == LensType.ULTRAWIDE }
+                    if (secondaryLens != null) {
+                        backgroundLensManager.prepareSecondaryLens(mainLens, secondaryLens, inventory.lenses)
+                    }
+                }
+            }
+
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                backgroundLensManager.setUltraWideSurfaceTexture(st, width, height)
+                updateCamera2TextureTransform(width, height, camera2PreviewSize.width, camera2PreviewSize.height, tv)
+            }
+
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                backgroundLensManager.setUltraWideSurfaceTexture(null, 0, 0)
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                onPreviewFrameAvailable(PreviewStreamSource.ULTRAWIDE)
+            }
+        }
+    }
+
+    fun onPreviewFrameAvailable(source: PreviewStreamSource) {
+        val wasOverlapping = zoomTransitionController.previewOverlapState.value.isOverlapping
+        zoomTransitionController.onPreviewFrameAvailable(source)
+        val handoffCompleted = wasOverlapping && !zoomTransitionController.previewOverlapState.value.isOverlapping
+        if (handoffCompleted) {
+            mainHandler.post {
+                backgroundLensManager.syncStandbyStreamSettings(inventory.lenses)
+            }
+        }
     }
 
     /**
@@ -496,10 +559,10 @@ class CameraEngine(
 
         LensDebugLog.log("openCamera2 called for ${lens.displayName} (cameraId=${lens.cameraId}, surface=${if (camera2Surface != null) "ready" else "null"})")
 
-        // Release standby camera before opening Camera2 to avoid hardware concurrency limits.
-        // Reveal the already-attached TextureView before opening the device so its Surface is ready
-        // by the time onOpened arrives; do not rely on a later post to make a GONE view allocate it.
-        backgroundLensManager.release()
+        // Release standby camera only if it is the same camera ID being opened
+        if (backgroundLensManager.getStandbyCameraDevice()?.id == lens.cameraId) {
+            backgroundLensManager.release()
+        }
         closeCamera2(keepTexture = true)
         camera2PreviewHost?.let { ensureCamera2TextureView(it) }
             ?: (previewView?.parent as? FrameLayout)?.let { ensureCamera2TextureView(it) }
@@ -1492,7 +1555,7 @@ class CameraEngine(
             val secondaryLens = if ((targetLens ?: activeDiscoveredLens)?.lensType == LensType.ULTRAWIDE) mainLens
                 else matchingLenses.firstOrNull { it.lensType == LensType.ULTRAWIDE }
                     ?: matchingLenses.firstOrNull { it.lensType == LensType.TELEPHOTO || it.lensType == LensType.TELEPHOTO_3X }
-            backgroundLensManager.prepareSecondaryLens(mainLens, secondaryLens)
+            backgroundLensManager.prepareSecondaryLens(mainLens, secondaryLens, inventory.lenses)
         }
     }
 
@@ -2032,110 +2095,106 @@ class CameraEngine(
             Log.i("LensDiag", "[0.5x REQUEST] switchCameraToLens: ${targetLens.displayName}, Strategy: $path (isHiddenAux=$isHiddenAux, cameraXHasCamera=$cameraXHasCamera)")
         }
 
-        // For hidden auxiliary lenses (e.g. vendor aux camera ID 2, 3, etc.) or when CameraX doesn't have the camera ID,
-        // or for Ultra-Wide when on a separate camera ID:
-        // Use Camera2 API directly!
-        if (!isPrimaryMainCameraX && (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0"))) {
-            Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
-            val cam = camera
-            if (cam != null) {
-                val closedDeferred = CompletableDeferred<Unit>()
-                val observer = object : Observer<CameraState> {
-                    override fun onChanged(state: CameraState) {
-                        if (state.type == CameraState.Type.CLOSED) {
-                            cam.cameraInfo.cameraState.removeObserver(this)
-                            closedDeferred.complete(Unit)
-                        }
-                    }
-                }
-                cam.cameraInfo.cameraState.observeForever(observer)
-                cam.cameraInfo.zoomState.removeObserver(zoomObserver)
-                LensDebugLog.log("unbindAll called")
-                provider?.unbindAll()
-                camera = null
-                imageCapture = null
-                videoCapture = null
-                analysis = null
-                state.cameraReady = false
+        val isSwitchBetweenMainAndUW = (currentLens?.lensType == LensType.WIDE && targetLens.lensType == LensType.ULTRAWIDE) ||
+            (currentLens?.lensType == LensType.ULTRAWIDE && targetLens.lensType == LensType.WIDE) ||
+            (targetLens.lensType == LensType.WIDE && isCamera2Active && targetLens.cameraId != camera2Device?.id)
 
-                engineScope.launch {
-                    val result = withTimeoutOrNull(1500L) {
-                        closedDeferred.await()
-                    }
-                    mainHandler.post {
-                        cam.cameraInfo.cameraState.removeObserver(observer)
-                        if (result != null) {
-                            LensDebugLog.log("CameraX camera state CLOSED reached")
-                        } else {
-                            LensDebugLog.log("CameraX camera state wait timed out after 1.5s, proceeding with openCamera2")
-                        }
-                        zoomFactor = targetLens.baseZoomRatio
-                        openCamera2(targetLens)
-                    }
-                }
-                return
-            } else {
-                LensDebugLog.log("unbindAll called (no active camera)")
-                provider?.unbindAll()
+        // 1. True 0ms instant stream swap when background preparation is ready!
+        if (settings.backgroundLensPreparation && isSwitchBetweenMainAndUW &&
+            backgroundLensManager.isStandbyReady() &&
+            backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
+
+            Log.i(TAG, "[LENS_SWITCH] Performing 0ms instant stream swap using prewarmed standby camera for ${targetLens.displayName}")
+            val activeSurf = if (isCamera2Active) camera2Surface else null
+            val swapResult = backgroundLensManager.swapActiveAndStandby(
+                oldActiveDevice = camera2Device,
+                oldActiveSession = camera2Session,
+                oldActiveBuilder = camera2RequestBuilder,
+                oldActiveSurface = activeSurf,
+                targetLens = targetLens,
+                availableLenses = inventory.lenses
+            )
+            if (swapResult != null) {
+                camera2Device = swapResult.newActiveDevice
+                camera2Session = swapResult.newActiveSession
+                camera2RequestBuilder = swapResult.newActiveBuilder
+                camera2Surface = swapResult.newActiveSurface
+                isCamera2Active = true
+                boundCameraId = swapResult.newActiveDevice.id
+                boundPhysicalId = targetLens.physicalCameraId
+                isUsingUltraWideSurface.value = (targetLens.lensType == LensType.ULTRAWIDE)
+                activeDiscoveredLens = targetLens
+                targetDiscoveredLens = null
+                isSwitchingLens.set(false)
+                firstTargetFrameArrived = true
                 zoomFactor = targetLens.baseZoomRatio
-                openCamera2(targetLens)
+                state.zoom = targetZoom
+                desiredZoom = targetZoom
+
+                swapResult.newActiveBuilder?.let { builder ->
+                    applyCamera2Zoom(targetZoom, builder)
+                    try {
+                        swapResult.newActiveSession.setRepeatingRequest(
+                            builder.build(),
+                            null,
+                            camera2Handler
+                        )
+                    } catch (_: Throwable) {}
+                }
+
+                if (camera != null) {
+                    try {
+                        provider?.unbindAll()
+                        camera = null
+                        imageCapture = null
+                        videoCapture = null
+                        analysis = null
+                    } catch (_: Throwable) {}
+                }
+
+                Log.i(TAG, "[LENS_SWITCH_SUCCESS] 0ms instant stream swap completed to ${targetLens.displayName} (activeCameraId=${swapResult.newActiveDevice.id})")
+                LensDebugLog.log("0ms instant stream swap completed to ${targetLens.displayName}")
                 return
             }
         }
 
-        // Returning from an independent Camera2 lens must be serialized after CameraDevice.onClosed.
-        // CameraX can otherwise race the old Camera2 device and fail to bind the main camera.
-        if (isCamera2Active) {
-            val closingCameraId = camera2Device?.id
-            Log.i(TAG, "[LENS_SWITCH_CAMX] Closing Camera2 ID $closingCameraId and returning to ${targetLens.displayName}")
-            LensDebugLog.log("return to CameraX requested: target=${targetLens.displayName}, closingCameraId=$closingCameraId")
-            closeCamera2(keepTexture = false)
-            val deferred = camera2CloseDeferred
-            engineScope.launch {
-                val closeConfirmed = if (deferred != null) {
-                    withTimeoutOrNull(4000L) {
-                        deferred.await()
-                        true
-                    } ?: false
-                } else {
-                    true
-                }
-                mainHandler.post {
-                    if (switchGen != lensSwitchGeneration.get()) {
-                        LensDebugLog.log("stale CameraX return ignored for ${targetLens.displayName} (switch generation changed)")
-                        return@post
-                    }
-                    LensDebugLog.log("Camera2 close confirmed=$closeConfirmed for ID $closingCameraId")
-                    if (!closeConfirmed) {
-                        Log.w(TAG, "[LENS_SWITCH_CAMX] Camera2 onClosed not confirmed within 4s; attempting CameraX rebind")
-                    }
-
-                    // Restore the selected CameraX lens explicitly. Never leave the old hidden
-                    // ultra-wide as the active/target lens while binding the main camera.
-                    activeDiscoveredLens = targetLens
-                    targetDiscoveredLens = targetLens
-                    desiredZoom = targetZoom
-                    state.zoom = targetZoom
-                    if (targetLens.isPrimaryMain || targetLens.lensType == LensType.WIDE) {
-                        zoomFactor = 1f
-                        boundPhysicalId = null
-                        if (settings.manualLens) state.manualLensId = null
-                    } else if (settings.manualLens) {
-                        state.manualLensId = targetLens.physicalCameraId ?: targetLens.cameraId
-                    }
-
-                    if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
-                        Log.i(TAG, "[LENS_SWITCH] Background lens is READY for ${targetLens.displayName}")
-                    }
-                    LensDebugLog.log("starting CameraX rebind for ${targetLens.displayName} at zoom=$desiredZoom")
-                    rebind()
-                }
-            }
+        // 2. For hidden auxiliary lenses (e.g. vendor aux camera ID 2, 3, etc.) or when CameraX doesn't have the camera ID,
+        // or for Ultra-Wide when on a separate camera ID:
+        // Use Camera2 API directly without black screen: keep the current stream visible while opening Camera2!
+        if (!isPrimaryMainCameraX && (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0"))) {
+            Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
+            zoomFactor = targetLens.baseZoomRatio
+            openCamera2(targetLens)
             return
         }
 
-        if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
-            Log.i(TAG, "[LENS_SWITCH] Background lens is READY for ${targetLens.displayName}")
+        // 3. Returning from Camera2 to Main:
+        // Keep the Ultra-Wide view visible while CameraX binds, preventing black frames.
+        if (isCamera2Active) {
+            val closingCameraId = camera2Device?.id
+            Log.i(TAG, "[LENS_SWITCH_CAMX] Returning to ${targetLens.displayName} from Camera2 ID $closingCameraId")
+            LensDebugLog.log("return to CameraX requested: target=${targetLens.displayName}, closingCameraId=$closingCameraId")
+
+            activeDiscoveredLens = targetLens
+            targetDiscoveredLens = targetLens
+            desiredZoom = targetZoom
+            state.zoom = targetZoom
+            if (targetLens.isPrimaryMain || targetLens.lensType == LensType.WIDE) {
+                zoomFactor = 1f
+                boundPhysicalId = null
+                if (settings.manualLens) state.manualLensId = null
+            } else if (settings.manualLens) {
+                state.manualLensId = targetLens.physicalCameraId ?: targetLens.cameraId
+            }
+
+            rebind()
+
+            mainHandler.postDelayed({
+                isUsingUltraWideSurface.value = false
+                closeCamera2(keepTexture = true)
+                isSwitchingLens.set(false)
+            }, 300L)
+            return
         }
 
         if (settings.manualLens) {
@@ -2151,7 +2210,7 @@ class CameraEngine(
             val mainLens = backLenses.firstOrNull { it.isPrimaryMain } ?: backLenses.firstOrNull { it.lensType == LensType.WIDE }
             val secondaryLens = backLenses.firstOrNull { it.lensType == LensType.ULTRAWIDE }
                 ?: backLenses.firstOrNull { it.lensType == LensType.TELEPHOTO || it.lensType == LensType.TELEPHOTO_3X }
-            backgroundLensManager.prepareSecondaryLens(mainLens, secondaryLens)
+            backgroundLensManager.prepareSecondaryLens(mainLens, secondaryLens, inventory.lenses)
         } else {
             backgroundLensManager.release()
         }

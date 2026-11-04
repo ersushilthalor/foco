@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.provider.MediaStore
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
+import android.view.TextureView
 import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
@@ -22,13 +23,16 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import io.github.realkhfan.foco.camera.CameraEngine
+import io.github.realkhfan.foco.camera.lens.PreviewStreamSource
 import io.github.realkhfan.foco.device.LocationTracker
 import io.github.realkhfan.foco.device.MicStatus
 import io.github.realkhfan.foco.device.OrientationWatcher
@@ -210,19 +214,20 @@ open class MainActivity : ComponentActivity() {
             PermissionScreen(state, coordinator)
             return
         }
+
+        val overlapState by engine.zoomTransitionController.previewOverlapState.collectAsStateWithLifecycle()
+        val isUsingUltraWide by engine.isUsingUltraWideSurface.collectAsStateWithLifecycle()
+
         CameraScreen(state, settings, coordinator) { modifier ->
             AndroidView(
                 factory = { context ->
-                    // Keep CameraX PreviewView and the hidden-lens Camera2 TextureView as siblings.
-                    // PreviewView owns its internal children and may recreate them during use-case binding;
-                    // embedding our TextureView inside it lets that lifecycle destroy the Camera2 SurfaceTexture.
                     FrameLayout(context).apply {
                         clipChildren = true
                         clipToPadding = true
 
                         val cameraXPreview = PreviewView(context).apply {
                             scaleType = PreviewView.ScaleType.FILL_CENTER
-                            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                         }
                         addView(
                             cameraXPreview,
@@ -232,8 +237,46 @@ open class MainActivity : ComponentActivity() {
                             )
                         )
 
+                        val ultraWideTv = TextureView(context).apply {
+                            layoutParams = FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT
+                            )
+                            visibility = android.view.View.VISIBLE
+                            alpha = 0f
+                        }
+                        addView(ultraWideTv)
+
                         engine.camera2PreviewHost = this
                         engine.previewView = cameraXPreview
+                        engine.setUltraWidePreviewTextureView(ultraWideTv)
+                    }
+                },
+                update = { host ->
+                    val isUw = isUsingUltraWide
+                    val isOverlapping = overlapState.isOverlapping
+                    val mainOnTop = overlapState.topSource == PreviewStreamSource.MAIN
+
+                    val mainAlpha = if (isOverlapping) overlapState.mainAlpha else (if (!isUw) 1f else 0f)
+                    val uwAlpha = if (isOverlapping) overlapState.ultraWideAlpha else (if (isUw) 1f else 0f)
+
+                    val mainZ = if (isOverlapping) (if (mainOnTop) 2f else 1f) else (if (!isUw) 2f else 0f)
+                    val uwZ = if (isOverlapping) (if (!mainOnTop) 2f else 1f) else (if (isUw) 2f else 0f)
+
+                    engine.previewView?.let { pv ->
+                        pv.alpha = mainAlpha
+                        pv.translationZ = mainZ
+                        pv.visibility = android.view.View.VISIBLE
+                    }
+                    engine.camera2TextureView?.let { tv ->
+                        tv.alpha = mainAlpha
+                        tv.translationZ = mainZ
+                        tv.visibility = android.view.View.VISIBLE
+                    }
+                    engine.ultraWideTextureView?.let { tv ->
+                        tv.alpha = uwAlpha
+                        tv.translationZ = uwZ
+                        tv.visibility = android.view.View.VISIBLE
                     }
                 },
                 modifier = modifier,

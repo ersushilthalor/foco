@@ -813,7 +813,7 @@ private fun RecordingTimer(state: AppState, modifier: Modifier) {
 @Composable
 private fun BottomControls(state: AppState, settings: AppSettings, actions: CameraActions, iconRotation: Float, modifier: Modifier) {
     Column(
-        modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 13.dp),
+        modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         state.qrText?.let { if (!state.recording && !state.burstActive) QrChip(it, actions) }
@@ -843,7 +843,7 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
                 state.burstActive -> Unit
                 tool != null && state.proBarOpen -> ToolSlider(state, tool, actions, Modifier.padding(bottom = 4.dp))
                 state.zoomChips.size > 1 && !(state.kind == CaptureKind.PHOTO && state.photoMode == PhotoMode.PANORAMA) ->
-                    ZoomChips(state, actions, iconRotation, Modifier.padding(bottom = 22.dp).scale(0.75f).offset(y = 20.dp))
+                    ZoomChips(state, actions, iconRotation, Modifier.padding(bottom = 34.dp))
             }
         }
         Spacer(Modifier.height(8.dp))
