@@ -406,6 +406,7 @@ class CameraEngine(
                     camera2SessionGen.incrementAndGet()
                     try { oldSession?.close() } catch (_: Throwable) {}
                     if (isCamera2Active && camera2Device != null) {
+                        firstTargetFrameArrived = false
                         startCamera2Watchdog(Camera2WatchdogStage.SURFACE, 8000L)
                     }
                     return true
@@ -557,6 +558,12 @@ class CameraEngine(
     }
 
     private fun createCamera2Session(comboStage: Int = 1) {
+        // TextureView state and SurfaceTexture ownership are confined to the main thread.
+        // Camera2 state callbacks may arrive on camera2Handler, so marshal session setup here.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { createCamera2Session(comboStage) }
+            return
+        }
         val device = camera2Device ?: return
         val surf = resolveCamera2PreviewSurface()
         val lens = targetDiscoveredLens ?: activeDiscoveredLens ?: return
