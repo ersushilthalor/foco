@@ -2227,8 +2227,11 @@ class CameraEngine(
         // or for Ultra-Wide when on a separate camera ID:
         // Use Camera2 API directly!
         if (!isPrimaryMainCameraX && (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0"))) {
-            if (!backgroundLensManager.isStandbyReady()) {
-                Log.i(TAG, "[STANDBY_READY] false; releasing incomplete standby before sequential fallback")
+            val preparedStandby = backgroundLensManager.getStandbyLens()
+            val canReuseStandbyForTarget = backgroundLensManager.isStandbyReady() &&
+                preparedStandby?.cameraId == targetLens.cameraId
+            if (!canReuseStandbyForTarget) {
+                Log.i(TAG, "[STANDBY_READY] false for target camera=${targetLens.cameraId}; releasing standby before sequential fallback")
                 backgroundLensManager.release()
             }
             Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
