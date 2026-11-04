@@ -35,6 +35,7 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import androidx.annotation.OptIn
@@ -93,7 +94,7 @@ import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
-import androidx.camera.core.SurfaceRequest
+import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.Observer
@@ -240,77 +241,81 @@ class CameraEngine(
             if (value != null) ensureCamera2TextureView(value)
         }
 
-    private var pendingMainSurfaceRequest: SurfaceRequest? = null
-    @Volatile private var mainPreviewSurface: Surface? = null
-    private var lastMainPreviewFrameAtMs = 0L
-    private var lastUltraWidePreviewFrameAtMs = 0L
-    private var lensSwitchRequestedAtMs = 0L
-    private var crossfadeStartLogged = false
+    private var cameraXPreviewTextureView: TextureView? = null
+    private var cameraXPreviewOriginalListener: TextureView.SurfaceTextureListener? = null
+    private var cameraXPreviewWrappedListener: TextureView.SurfaceTextureListener? = null
+    private var cameraXPreviewLayoutListener: android.view.ViewTreeObserver.OnGlobalLayoutListener? = null
 
     private val _activePreviewSource = MutableStateFlow(PreviewStreamSource.MAIN)
     val activePreviewSource: StateFlow<PreviewStreamSource> = _activePreviewSource.asStateFlow()
 
-    private val cameraXMainSurfaceProvider = Preview.SurfaceProvider { request ->
-        mainHandler.post { provideMainPreviewSurface(request) }
-    }
-
-    var previewView: TextureView? = null
+    var previewView: PreviewView? = null
         set(value) {
             field = value
             if (value != null) {
-                value.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                        pendingMainSurfaceRequest?.let { request ->
-                            pendingMainSurfaceRequest = null
-                            provideMainPreviewSurface(request)
+                // COMPATIBLE uses CameraX's TextureView implementation, allowing the real buffer
+                // arrival callback to be forwarded without replacing CameraX's own listener.
+                value.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                value.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                    attachCameraXFrameListener()
+                }
+                val observer = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+                    override fun onGlobalLayout() {
+                        if (attachCameraXFrameListener()) {
+                            cameraXPreviewLayoutListener = null
+                            if (value.viewTreeObserver.isAlive) {
+                                value.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                            }
                         }
-                        if (provider != null && camera == null && !isCamera2Active) {
-                            mainHandler.post { rebind() }
-                        }
-                    }
-                    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
-                    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                        pendingMainSurfaceRequest?.willNotProvideSurface()
-                        pendingMainSurfaceRequest = null
-                        return true
-                    }
-                    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-                        onViewfinderFrameAvailable(PreviewStreamSource.MAIN)
                     }
                 }
+                cameraXPreviewLayoutListener = observer
+                value.viewTreeObserver.addOnGlobalLayoutListener(observer)
+                value.post { attachCameraXFrameListener() }
                 val host = camera2PreviewHost ?: (value.parent as? FrameLayout)
                 host?.let { ensureCamera2TextureView(it) }
-                if (value.isAvailable) {
-                    pendingMainSurfaceRequest?.let { request ->
-                        pendingMainSurfaceRequest = null
-                        provideMainPreviewSurface(request)
-                    }
-                }
                 if (provider != null && camera == null && !isCamera2Active) rebind()
             }
         }
 
-    private fun provideMainPreviewSurface(request: SurfaceRequest) {
-        val textureView = previewView
-        val texture = textureView?.takeIf { it.isAvailable }?.surfaceTexture
-        if (texture == null) {
-            pendingMainSurfaceRequest?.willNotProvideSurface()
-            pendingMainSurfaceRequest = request
-            return
-        }
-        try {
-            val resolution = request.resolution
-            texture.setDefaultBufferSize(resolution.width, resolution.height)
-            val surface = Surface(texture)
-            mainPreviewSurface = surface
-            request.provideSurface(surface, mainExecutor) {
-                if (mainPreviewSurface === surface) mainPreviewSurface = null
-                runCatching { surface.release() }
+    private fun findPreviewTextureView(view: android.view.View): TextureView? {
+        if (view is TextureView) return view
+        if (view is ViewGroup) {
+            for (index in 0 until view.childCount) {
+                findPreviewTextureView(view.getChildAt(index))?.let { return it }
             }
-        } catch (t: Throwable) {
-            Log.e(TAG, "Unable to provide CameraX main TextureView surface", t)
-            request.willNotProvideSurface()
         }
+        return null
+    }
+
+    private fun attachCameraXFrameListener(): Boolean {
+        val host = previewView ?: return false
+        val textureView = findPreviewTextureView(host) ?: return false
+        if (textureView === cameraXPreviewTextureView &&
+            textureView.surfaceTextureListener === cameraXPreviewWrappedListener
+        ) return true
+
+        val original = textureView.surfaceTextureListener ?: return false
+        val wrapper = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                original.onSurfaceTextureAvailable(surface, width, height)
+            }
+            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+                original.onSurfaceTextureSizeChanged(surface, width, height)
+            }
+            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                return original.onSurfaceTextureDestroyed(surface)
+            }
+            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+                original.onSurfaceTextureUpdated(surface)
+                onViewfinderFrameAvailable(PreviewStreamSource.MAIN)
+            }
+        }
+        textureView.surfaceTextureListener = wrapper
+        cameraXPreviewTextureView = textureView
+        cameraXPreviewOriginalListener = original
+        cameraXPreviewWrappedListener = wrapper
+        return true
     }
 
     private fun onViewfinderFrameAvailable(source: PreviewStreamSource) {
@@ -1606,7 +1611,7 @@ class CameraEngine(
         }
     }
 
-    private fun buildUseCases(view: TextureView, caps: Capabilities, setup: Setup, physicalCameraId: String? = boundPhysicalId): List<UseCase> {
+    private fun buildUseCases(view: PreviewView, caps: Capabilities, setup: Setup, physicalCameraId: String? = boundPhysicalId): List<UseCase> {
         val isVideo = state.kind == CaptureKind.VIDEO
         val ratio = if (isVideo || settings.ratio == RatioSetting.WIDE_9_16) AspectRatio.RATIO_16_9 else AspectRatio.RATIO_4_3
         val aspect = AspectRatioStrategy(ratio, AspectRatioStrategy.FALLBACK_RULE_AUTO)
@@ -1617,7 +1622,7 @@ class CameraEngine(
             Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(physicalCameraId)
         }
         Camera2Interop.Extender(previewBuilder).setSessionCaptureCallback(captureCallback)
-        val preview = previewBuilder.build().also { it.setSurfaceProvider(cameraXMainSurfaceProvider) }
+        val preview = previewBuilder.build().also { it.setSurfaceProvider(view.surfaceProvider) }
         val cases = mutableListOf<UseCase>(preview)
         imageCapture = null
         videoCapture = null
