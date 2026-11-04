@@ -1,8 +1,5 @@
 package io.github.realkhfan.foco.ui
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -36,7 +33,6 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -98,8 +94,6 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -111,7 +105,6 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import io.github.realkhfan.foco.R
 import io.github.realkhfan.foco.camera.ExposureMath
 import io.github.realkhfan.foco.camera.ZoomMath
 import io.github.realkhfan.foco.device.MicStatus
@@ -149,20 +142,6 @@ fun CameraScreen(
     val statusTop = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding()
     val navBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val wide = state.kind == CaptureKind.VIDEO || settings.ratio == RatioSetting.WIDE_9_16
-    val hasAdjustableZoom = state.cameraReady &&
-        state.minZoom.isFinite() && state.maxZoom.isFinite() &&
-        state.minZoom > 0f && state.maxZoom > state.minZoom &&
-        state.zoomChips.size > 1
-    var zoomPanelVisible by remember { mutableStateOf(false) }
-    var zoomPanelRequest by remember { mutableStateOf(0) }
-
-    LaunchedEffect(zoomPanelRequest) {
-        if (zoomPanelRequest > 0) {
-            zoomPanelVisible = true
-            delay(2_000L)
-            zoomPanelVisible = false
-        }
-    }
 
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
         // 4:3 sits just above the shutter row so the zoom chips always overlap the picture (as on Pixel);
@@ -178,72 +157,12 @@ fun CameraScreen(
                 .aspectRatio(if (wide) 9f / 16f else 3f / 4f),
         ) {
             preview(Modifier.fillMaxSize())
-            ViewfinderOverlays(state, settings, actions) { if (hasAdjustableZoom) zoomPanelRequest++ }
+            ViewfinderOverlays(state, settings, actions)
         }
 
         TopBar(state, settings, actions, iconRotation, Modifier.align(Alignment.TopCenter).padding(top = statusTop))
 
         BottomControls(state, settings, actions, iconRotation, Modifier.align(Alignment.BottomCenter))
-
-        AnimatedVisibility(
-            visible = zoomPanelVisible && hasAdjustableZoom &&
-                !state.burstActive && state.review == null &&
-                !state.settingsOpen && state.viewerItems == null,
-            enter = fadeIn(tween(0)),
-            exit = fadeOut(tween(300)),
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 16.dp, bottom = navBottom),
-        ) {
-            val minZoom = state.minZoom
-            val maxZoom = state.maxZoom
-            val zoomSpan = (maxZoom - minZoom).coerceAtLeast(0.0001f)
-            val linearZoom = ((state.zoom - minZoom) / zoomSpan).coerceIn(0f, 1f)
-
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Image(
-                    painter = painterResource(R.drawable.foco_zoom_in),
-                    contentDescription = null,
-                    modifier = Modifier
-                        .padding(bottom = 10.dp)
-                        .size(24.dp)
-                        .rotate(iconRotation),
-                )
-                AndroidView(
-                    factory = { context ->
-                        FocoZoomBar(context).apply {
-                            render(
-                                zoomRatio = state.zoom,
-                                linearZoom = linearZoom,
-                            ) { progress ->
-                                actions.setZoom(
-                                    (minZoom + progress * zoomSpan).coerceIn(minZoom, maxZoom),
-                                )
-                            }
-                        }
-                    },
-                    modifier = Modifier.width(32.dp).height(250.dp),
-                    update = { bar ->
-                        bar.render(
-                            zoomRatio = state.zoom,
-                            linearZoom = linearZoom,
-                        ) { progress ->
-                            actions.setZoom(
-                                (minZoom + progress * zoomSpan).coerceIn(minZoom, maxZoom),
-                            )
-                        }
-                    },
-                )
-                Image(
-                    painter = painterResource(R.drawable.foco_zoom_out),
-                    contentDescription = null,
-                    modifier = Modifier
-                        .padding(top = 10.dp, bottom = 32.dp)
-                        .size(24.dp)
-                        .rotate(iconRotation),
-                )
-            }
-        }
 
         if (state.viewerItems == null && !state.fullSettingsOpen) MessageToast(state)
 
@@ -295,7 +214,7 @@ private fun rememberIconRotation(deviceRotation: Int): Float {
 // ------------------------------------------------------------------------------------- viewfinder
 
 @Composable
-private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: CameraActions, onPreviewFocus: () -> Unit) {
+private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: CameraActions) {
     var size by remember { mutableStateOf(IntSize.Zero) }
     val density = LocalDensity.current
     val swipeThreshold = with(density) { 70.dp.toPx() }
@@ -307,19 +226,9 @@ private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: 
             .onSizeChanged { size = it }
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = {
-                        if (state.review == null && !state.burstActive) {
-                            actions.focusAt(it, size.width, size.height, lock = false)
-                            onPreviewFocus()
-                        }
-                    },
+                    onTap = { if (state.review == null && !state.burstActive) actions.focusAt(it, size.width, size.height, lock = false) },
                     onDoubleTap = { actions.setZoom(if (state.zoom < 1.9f) 2f else 1f, fromChip = true) },
-                    onLongPress = {
-                        if (!state.burstActive) {
-                            actions.focusAt(it, size.width, size.height, lock = true)
-                            onPreviewFocus()
-                        }
-                    },
+                    onLongPress = { if (!state.burstActive) actions.focusAt(it, size.width, size.height, lock = true) },
                 )
             }
             .pointerInput(Unit) {
