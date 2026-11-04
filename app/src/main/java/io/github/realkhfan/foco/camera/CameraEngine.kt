@@ -1416,6 +1416,7 @@ class CameraEngine(
             val msg = if (failedLens != null) "Failed to activate ${failedLens.displayName}" else "Camera couldn't be started"
             state.message = msg
             Log.e(TAG, "[LENS_SWITCH_FAILURE] $msg (active: ${activeDiscoveredLens?.displayName})")
+            LensDebugLog.log("CameraX rebind failed for ${failedLens?.displayName ?: "current lens"}")
             return
         }
         camera = cam
@@ -1479,6 +1480,11 @@ class CameraEngine(
             isSwitchingLens.set(false)
         } else {
             activeDiscoveredLens = newlyBoundLens
+            if (targetDiscoveredLens?.id == targetLens?.id) {
+                targetDiscoveredLens = null
+            }
+            isSwitchingLens.set(false)
+            LensDebugLog.log("CameraX rebind complete: active=${newlyBoundLens?.displayName}, cameraId=$boundCameraId, zoom=${state.zoom}")
         }
 
         if (settings.backgroundLensPreparation && currentFacing == CameraSelector.LENS_FACING_BACK) {
@@ -2062,34 +2068,55 @@ class CameraEngine(
             }
         }
 
-        // Otherwise, if switching back from Camera2 to CameraX (e.g. 0.5x -> 1x Main):
+        // Returning from an independent Camera2 lens must be serialized after CameraDevice.onClosed.
+        // CameraX can otherwise race the old Camera2 device and fail to bind the main camera.
         if (isCamera2Active) {
-            Log.i(TAG, "[LENS_SWITCH_CAMX] Closing Camera2 and returning to CameraX for ${targetLens.displayName}")
-            LensDebugLog.log("Closing Camera2 before returning to CameraX for ${targetLens.displayName}")
+            val closingCameraId = camera2Device?.id
+            Log.i(TAG, "[LENS_SWITCH_CAMX] Closing Camera2 ID $closingCameraId and returning to ${targetLens.displayName}")
+            LensDebugLog.log("return to CameraX requested: target=${targetLens.displayName}, closingCameraId=$closingCameraId")
             closeCamera2(keepTexture = false)
             val deferred = camera2CloseDeferred
-            if (deferred != null && !deferred.isCompleted) {
-                engineScope.launch {
-                    val result = withTimeoutOrNull(1500L) {
+            engineScope.launch {
+                val closeConfirmed = if (deferred != null) {
+                    withTimeoutOrNull(4000L) {
                         deferred.await()
-                    }
-                    mainHandler.post {
-                        if (result != null) {
-                            LensDebugLog.log("Camera2 device CLOSED reached")
-                        } else {
-                            LensDebugLog.log("Camera2 device wait timed out after 1.5s, proceeding with rebind")
-                        }
-                        if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
-                            Log.i(TAG, "[LENS_SWITCH] Background lens is READY for ${targetLens.displayName}")
-                        }
-                        if (settings.manualLens) {
-                            state.manualLensId = targetLens.physicalCameraId ?: targetLens.cameraId
-                        }
-                        rebind()
-                    }
+                        true
+                    } ?: false
+                } else {
+                    true
                 }
-                return
+                mainHandler.post {
+                    if (switchGen != lensSwitchGeneration.get()) {
+                        LensDebugLog.log("stale CameraX return ignored for ${targetLens.displayName} (switch generation changed)")
+                        return@post
+                    }
+                    LensDebugLog.log("Camera2 close confirmed=$closeConfirmed for ID $closingCameraId")
+                    if (!closeConfirmed) {
+                        Log.w(TAG, "[LENS_SWITCH_CAMX] Camera2 onClosed not confirmed within 4s; attempting CameraX rebind")
+                    }
+
+                    // Restore the selected CameraX lens explicitly. Never leave the old hidden
+                    // ultra-wide as the active/target lens while binding the main camera.
+                    activeDiscoveredLens = targetLens
+                    targetDiscoveredLens = targetLens
+                    desiredZoom = targetZoom
+                    state.zoom = targetZoom
+                    if (targetLens.isPrimaryMain || targetLens.lensType == LensType.WIDE) {
+                        zoomFactor = 1f
+                        boundPhysicalId = null
+                        if (settings.manualLens) state.manualLensId = null
+                    } else if (settings.manualLens) {
+                        state.manualLensId = targetLens.physicalCameraId ?: targetLens.cameraId
+                    }
+
+                    if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
+                        Log.i(TAG, "[LENS_SWITCH] Background lens is READY for ${targetLens.displayName}")
+                    }
+                    LensDebugLog.log("starting CameraX rebind for ${targetLens.displayName} at zoom=$desiredZoom")
+                    rebind()
+                }
             }
+            return
         }
 
         if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
