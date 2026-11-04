@@ -47,7 +47,7 @@ internal class FocoZoomBar : AppCompatSeekBar {
         onValueChanged: (Float) -> Unit,
     ) {
         onLinearZoomChanged = onValueChanged
-        val next = RenderedZoom(zoomRatio = zoomRatio, linear = linearZoom.coerceIn(0f, 1f))
+        val next = RenderedZoom(ratio = zoomRatio, linear = linearZoom.coerceIn(0f, 1f))
         if (next == renderedZoom) return
         renderedZoom = next
 
