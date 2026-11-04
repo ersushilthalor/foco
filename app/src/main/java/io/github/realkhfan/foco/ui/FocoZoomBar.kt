@@ -10,26 +10,30 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.widget.TextView
-import android.widget.SeekBar
+import androidx.appcompat.widget.AppCompatSeekBar
 import io.github.realkhfan.foco.R
 import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * VibeCam's original vertical SeekBar, adapted to Foco's zoom-ratio action boundary.
- * The rotated measurement, canvas transform, bitmap thumb, and touch-to-linear-zoom mapping
- * intentionally follow VibeCam's ZoomBar implementation.
+ * VibeCam's original vertical ZoomBar, with only its activity callback replaced by
+ * Foco's existing ratio-based CameraActions.setZoom() boundary.
+ *
+ * The rotated measurement/drawing, custom bitmap thumb, 0..100 linear track and touch
+ * mapping are kept in the same shape as VibeCam's ZoomBar implementation.
  */
-internal class FocoZoomBar : SeekBar {
+internal class FocoZoomBar : AppCompatSeekBar {
     constructor(context: Context) : super(context)
     constructor(context: Context, attrs: AttributeSet?) : super(context, attrs)
     constructor(context: Context, attrs: AttributeSet?, defStyle: Int) : super(context, attrs, defStyle)
 
     @SuppressLint("InflateParams")
     private val thumbView: View = LayoutInflater.from(context)
-        .inflate(R.layout.foco_vibecam_zoom_bar_thumb, null, false)
+        .inflate(R.layout.foco_zoom_bar_thumb, null, false)
 
-    private var renderedZoomRatio: Float? = null
+    private data class RenderedZoom(val ratio: Float, val linear: Float)
+
+    private var renderedZoom: RenderedZoom? = null
     private var onLinearZoomChanged: ((Float) -> Unit)? = null
 
     init {
@@ -37,24 +41,22 @@ internal class FocoZoomBar : SeekBar {
         progressTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.TRANSPARENT)
     }
 
-    fun renderZoom(
-        linearZoom: Float,
+    fun render(
         zoomRatio: Float,
+        linearZoom: Float,
         onValueChanged: (Float) -> Unit,
     ) {
         onLinearZoomChanged = onValueChanged
-        progress = (linearZoom.coerceIn(0f, 1f) * 100f).roundToInt()
+        val next = RenderedZoom(zoomRatio = zoomRatio, linear = linearZoom.coerceIn(0f, 1f))
+        if (next == renderedZoom) return
+        renderedZoom = next
 
-        if (renderedZoomRatio == zoomRatio) return
-        renderedZoomRatio = zoomRatio
+        progress = (next.linear * 100f).roundToInt()
 
         val textView = thumbView.findViewById<TextView>(R.id.foco_zoom_progress)
         textView.text = String.format(Locale.getDefault(), "%.1fx", zoomRatio)
 
-        thumbView.measure(
-            MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED),
-            MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED),
-        )
+        thumbView.measure(MeasureSpec.UNSPECIFIED, MeasureSpec.UNSPECIFIED)
         val bitmap = Bitmap.createBitmap(
             thumbView.measuredWidth,
             thumbView.measuredHeight,
@@ -89,19 +91,13 @@ internal class FocoZoomBar : SeekBar {
 
         when (event.action) {
             MotionEvent.ACTION_MOVE, MotionEvent.ACTION_DOWN -> {
-                val progressValue = (
-                    max - (max * event.y / height).toInt()
-                ).coerceIn(1, max.coerceAtLeast(1))
-                onLinearZoomChanged?.invoke(progressValue / max.toFloat())
+                var value = max - (max * event.y / height).toInt()
+                if (value < 1) value = 1
+                if (value > 100) value = 100
+                onLinearZoomChanged?.invoke(value / 100f)
             }
-            MotionEvent.ACTION_UP -> performClick()
             MotionEvent.ACTION_CANCEL -> Unit
         }
-        return true
-    }
-
-    override fun performClick(): Boolean {
-        super.performClick()
         return true
     }
 }

@@ -1,0 +1,544 @@
+package io.github.realkhfan.foco.camera.lens
+
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.os.Build
+import android.util.Log
+import android.util.SizeF
+import kotlin.math.abs
+import kotlin.math.sqrt
+
+private const val TAG = "CameraDiscovery"
+
+/**
+ * Camera Discovery & Lens Classification Engine.
+ * Replicated from source reference camera discovery architecture.
+ *
+ * Provides a reliable camera inventory that:
+ * - Discovers available cameras using Camera2 API.
+ * - Probes hidden vendor auxiliary cameras (0..12).
+ * - Identifies logical multi-cameras and their advertised physical camera IDs.
+ * - Distinguishes independent cameras from physical lenses inside logical cameras.
+ * - Maps lens types using actual camera characteristics (focal length, sensor size, FOV, 35mm equivalent).
+ * - Avoids hardcoded camera IDs and assumptions about device hardware.
+ * - Prevents duplicate or incorrectly classified lens entries.
+ */
+object CameraDiscovery {
+
+    fun discover(cameraManager: CameraManager?): CameraInventory {
+        if (cameraManager == null) {
+            return CameraInventory(emptyList())
+        }
+
+        try {
+            val officialIds = try {
+                cameraManager.cameraIdList.toList()
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to get cameraIdList", t)
+                emptyList()
+            }
+
+            val characteristicsMap = mutableMapOf<String, CameraCharacteristics>()
+            fun getChars(id: String): CameraCharacteristics? {
+                return characteristicsMap.getOrPut(id) {
+                    try {
+                        cameraManager.getCameraCharacteristics(id)
+                    } catch (t: Throwable) {
+                        return null
+                    }
+                }
+            }
+
+            // Candidate camera IDs: start with official IDs from CameraManager
+            val candidateIds = linkedSetOf<String>()
+            candidateIds.addAll(officialIds)
+
+            // Probe vendor auxiliary cameras safely (0..24, and OEM IDs 100..102) that might not be in official cameraIdList
+            val auxProbeIds = (0..24).map { it.toString() } + listOf("100", "101", "102")
+            for (sId in auxProbeIds) {
+                if (!candidateIds.contains(sId)) {
+                    val chars = getChars(sId)
+                    if (chars != null) {
+                        candidateIds.add(sId)
+                    }
+                }
+            }
+
+            logStartupDiagnostics(cameraManager, officialIds, candidateIds, ::getChars)
+
+            val logicalToPhysical = mutableMapOf<String, Set<String>>()
+            val physicalToLogical = mutableMapOf<String, String>()
+
+            // Identify Logical Multi-Cameras (API 28+)
+            for (id in candidateIds) {
+                val chars = getChars(id) ?: continue
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+                    val isLogical = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
+                    if (isLogical) {
+                        val physIds = chars.physicalCameraIds
+                        if (physIds.isNotEmpty()) {
+                            logicalToPhysical[id] = physIds
+                            for (pId in physIds) {
+                                physicalToLogical[pId] = id
+                                getChars(pId) // Pre-cache characteristics
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Find Primary Rear Camera
+            val primaryBackId = candidateIds.firstOrNull { id ->
+                getChars(id)?.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            } ?: candidateIds.firstOrNull() ?: "0"
+
+            val primaryFrontId = candidateIds.firstOrNull { id ->
+                getChars(id)?.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+            } ?: "1"
+
+            val primaryBackChars = getChars(primaryBackId)
+            val isPrimaryBackLogical = logicalToPhysical.containsKey(primaryBackId)
+
+            val primaryBackZoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                primaryBackChars?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            } else null
+            val primaryBackMinZoom = primaryBackZoomRange?.lower ?: 1.0f
+            val primaryBackMaxZoom = primaryBackZoomRange?.upper
+                ?: primaryBackChars?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+                ?: 8.0f
+            val hasLogicalUltraWide = primaryBackMinZoom < 0.95f
+
+            // Baseline Main Sensor dimensions
+            val primaryFocals = primaryBackChars?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: floatArrayOf(4.5f)
+            val primaryApertures = primaryBackChars?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES) ?: floatArrayOf(1.8f)
+            val primarySensorSize = primaryBackChars?.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: SizeF(6.4f, 4.8f)
+            val primaryDiag = if (primarySensorSize.width > 0 && primarySensorSize.height > 0) {
+                sqrt((primarySensorSize.width * primarySensorSize.width + primarySensorSize.height * primarySensorSize.height).toDouble()).toFloat()
+            } else 8.0f
+            val primaryCropFactor = if (primaryDiag > 0f) 43.27f / primaryDiag else 6.0f
+
+            // Find true primary main focal length (~24-28mm eq35, around 4-6.5mm)
+            val primaryMainFocal = primaryFocals.filter { (it * primaryCropFactor) in 21f..36f }
+                .minByOrNull { abs(it * primaryCropFactor - 26f) }
+                ?: primaryFocals.firstOrNull()
+                ?: 4.5f
+            val primaryMainEq35 = primaryMainFocal * primaryCropFactor
+            val primaryMainSensorWidth = primarySensorSize.width
+            val primaryMainFov = CameraOpticalCalibration.calculateHorizontalFovDegrees(primaryMainSensorWidth, primaryMainFocal)
+            val primaryMainAperture = primaryApertures.firstOrNull() ?: 1.8f
+
+            val lenses = mutableListOf<LensInfo>()
+            val registeredLensesTypes = mutableSetOf<String>()
+
+            // 1. Primary Back Main Wide (1x)
+            lenses.add(
+                LensInfo(
+                    cameraId = primaryBackId,
+                    facing = CameraCharacteristics.LENS_FACING_BACK,
+                    lensType = LensType.WIDE,
+                    displayName = "1x Main (${primaryMainFocal}mm f/${primaryMainAperture})",
+                    focalLengthMm = primaryMainFocal,
+                    maxAperture = primaryMainAperture,
+                    isPhysical = true,
+                    isHiddenAux = false,
+                    isZoomPreset = false,
+                    baseZoomRatio = 1.0f,
+                    minZoomRatio = 1.0f,
+                    maxZoomRatio = primaryBackMaxZoom,
+                    isLogicalMultiCamera = isPrimaryBackLogical,
+                    isPrimaryMain = true,
+                    isIndependentCamera = true,
+                    supportsPhysicalStream = false,
+                    intrinsicZoomRatio = 1.0f,
+                    fovDegrees = primaryMainFov,
+                    equivalent35mmFocalMm = primaryMainEq35,
+                    idTypeDescription = if (isPrimaryBackLogical) "Logical Multi-Cam Main (1x)" else "Primary Main Camera (1x)"
+                )
+            )
+            registeredLensesTypes.add("BACK_WIDE")
+
+            // 2. Discover Physical Lenses within Logical Multi-Camera (API 28+)
+            val physicalIdsForMain = logicalToPhysical[primaryBackId] ?: emptySet()
+            var detectedPhysicalUltraWide = false
+
+            for (physId in physicalIdsForMain) {
+                val physChars = getChars(physId) ?: continue
+                val facing = physChars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
+                if (facing != CameraCharacteristics.LENS_FACING_BACK) continue
+
+                val pFocals = physChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: floatArrayOf(4f)
+                val pApertures = physChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES) ?: floatArrayOf(1.8f)
+                val pSensor = physChars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: SizeF(5.0f, 3.8f)
+                val pMinFocus = physChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+
+                val pFocal = pFocals.firstOrNull() ?: 4f
+                val pAperture = pApertures.firstOrNull() ?: 1.8f
+                val pDiag = if (pSensor.width > 0 && pSensor.height > 0) {
+                    sqrt((pSensor.width * pSensor.width + pSensor.height * pSensor.height).toDouble()).toFloat()
+                } else 6.0f
+                val pCrop = if (pDiag > 0f) 43.27f / pDiag else 6.0f
+                val pEq35 = pFocal * pCrop
+                val pFov = CameraOpticalCalibration.calculateHorizontalFovDegrees(pSensor.width, pFocal)
+
+                val isUltraWide = (pEq35 in 1.0f..20.0f) || pFocal <= 2.8f || pFov >= 95.0f
+                val isTele3x = pEq35 >= 70f || pFocal >= 9.0f
+                val isTele2x = (pEq35 in 45f..70f || pFocal in 5.8f..9.0f) && !isTele3x
+                val isMacro = pMinFocus > 10f && pFocal < 3.2f
+
+                val pType = when {
+                    isUltraWide -> LensType.ULTRAWIDE
+                    isTele3x -> LensType.TELEPHOTO_3X
+                    isTele2x -> LensType.TELEPHOTO
+                    isMacro -> LensType.MACRO
+                    else -> LensType.WIDE
+                }
+
+                if (pType == LensType.WIDE) continue // Main wide already registered
+
+                if (pType == LensType.ULTRAWIDE) {
+                    detectedPhysicalUltraWide = true
+                }
+
+                val opticalRatio = CameraOpticalCalibration.calculateCalibratedOpticalRatio(
+                    lensFocalLengthMm = pFocal,
+                    lensSensorWidthMm = pSensor.width,
+                    mainFocalLengthMm = primaryMainFocal,
+                    mainSensorWidthMm = primaryMainSensorWidth,
+                    lensType = pType,
+                    logicalMinZoomRatio = if (hasLogicalUltraWide) primaryBackMinZoom else null
+                )
+
+                val key = "BACK_${pType.name}"
+                if (!registeredLensesTypes.contains(key)) {
+                    registeredLensesTypes.add(key)
+                    val effectiveBaseRatio = if (pType == LensType.ULTRAWIDE) 0.5f else opticalRatio
+                    val effectiveMinRatio = if (pType == LensType.ULTRAWIDE) 0.5f else primaryBackMinZoom
+                    val labelPrefix = if (pType == LensType.ULTRAWIDE) "0.5x" else "${opticalRatio}x"
+                    lenses.add(
+                        LensInfo(
+                            cameraId = primaryBackId, // Openable device is logical multi-camera
+                            facing = CameraCharacteristics.LENS_FACING_BACK,
+                            lensType = pType,
+                            displayName = "$labelPrefix ${pType.shortLabel} (${pFocal}mm f/${pAperture})",
+                            focalLengthMm = pFocal,
+                            maxAperture = pAperture,
+                            isPhysical = true,
+                            isHiddenAux = false,
+                            isZoomPreset = false,
+                            baseZoomRatio = effectiveBaseRatio,
+                            minZoomRatio = effectiveMinRatio,
+                            maxZoomRatio = primaryBackMaxZoom,
+                            isLogicalMultiCamera = true,
+                            isIndependentCamera = false,
+                            supportsPhysicalStream = true,
+                            intrinsicZoomRatio = effectiveBaseRatio,
+                            physicalCameraId = physId,
+                            fovDegrees = pFov,
+                            equivalent35mmFocalMm = pEq35,
+                            idTypeDescription = "Logical Multi-Cam Physical $physId"
+                        )
+                    )
+                }
+            }
+
+            // 3. Fallback for logical ultra-wide zoom (< 0.95x) if physical IDs were not advertised
+            if (hasLogicalUltraWide && !detectedPhysicalUltraWide && !registeredLensesTypes.contains("BACK_ULTRAWIDE")) {
+                registeredLensesTypes.add("BACK_ULTRAWIDE")
+                val uwRatio = 0.5f
+                lenses.add(
+                    LensInfo(
+                        cameraId = primaryBackId,
+                        facing = CameraCharacteristics.LENS_FACING_BACK,
+                        lensType = LensType.ULTRAWIDE,
+                        displayName = "0.5x Ultra Wide",
+                        focalLengthMm = primaryMainFocal * uwRatio,
+                        maxAperture = primaryMainAperture,
+                        isPhysical = true,
+                        isHiddenAux = false,
+                        isZoomPreset = false,
+                        baseZoomRatio = 0.5f,
+                        minZoomRatio = 0.5f,
+                        maxZoomRatio = primaryBackMaxZoom,
+                        isLogicalMultiCamera = isPrimaryBackLogical,
+                        isIndependentCamera = false,
+                        supportsPhysicalStream = false,
+                        intrinsicZoomRatio = 0.5f,
+                        fovDegrees = 110f,
+                        equivalent35mmFocalMm = primaryMainEq35 * uwRatio,
+                        idTypeDescription = "Logical Multi-Cam Optical Ultra-Wide"
+                    )
+                )
+            }
+
+            // 4. Standalone & Auxiliary Cameras (e.g. independent camera IDs like 1 for Front, 2 for Ultra-wide, 3 for Tele)
+            for (id in candidateIds) {
+                if (id == primaryBackId) continue
+                val chars = getChars(id) ?: continue
+                val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: continue
+
+                val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: floatArrayOf(4.0f)
+                val apertures = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES) ?: floatArrayOf(1.8f)
+                val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: SizeF(5.0f, 3.8f)
+                val minFocus = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                val maxAperture = apertures.firstOrNull() ?: 1.8f
+                val focalMm = focalLengths.firstOrNull() ?: 4.0f
+
+                val diagMm = if (sensorSize.width > 0 && sensorSize.height > 0) {
+                    sqrt((sensorSize.width * sensorSize.width + sensorSize.height * sensorSize.height).toDouble()).toFloat()
+                } else 6.0f
+                val cropFactor = if (diagMm > 0f) 43.27f / diagMm else 6.0f
+                val eq35mm = focalMm * cropFactor
+                val fovDegrees = CameraOpticalCalibration.calculateHorizontalFovDegrees(sensorSize.width, focalMm)
+
+                val isBack = facing == CameraCharacteristics.LENS_FACING_BACK
+                val isFront = facing == CameraCharacteristics.LENS_FACING_FRONT
+
+                val lensType = when {
+                    isFront -> LensType.FRONT
+                    (eq35mm in 1.0f..20.0f) || focalMm <= 2.8f || fovDegrees >= 95.0f -> LensType.ULTRAWIDE
+                    eq35mm >= 70f || focalMm >= 9.0f -> LensType.TELEPHOTO_3X
+                    (eq35mm in 45f..70f || focalMm in 5.8f..9.0f) -> LensType.TELEPHOTO
+                    minFocus > 10f && focalMm < 3.2f -> LensType.MACRO
+                    else -> LensType.WIDE
+                }
+
+                val key = if (isFront) "FRONT" else "BACK_${lensType.name}"
+                // If a logical physical lens for this perspective already exists, do not add duplicate standalone camera entry
+                if (registeredLensesTypes.contains(key)) {
+                    continue
+                }
+
+                registeredLensesTypes.add(key)
+                val isOfficial = officialIds.contains(id)
+                val opticalRatio = if (isFront) 1.0f else CameraOpticalCalibration.calculateCalibratedOpticalRatio(
+                    lensFocalLengthMm = focalMm,
+                    lensSensorWidthMm = sensorSize.width,
+                    mainFocalLengthMm = primaryMainFocal,
+                    mainSensorWidthMm = primaryMainSensorWidth,
+                    lensType = lensType
+                )
+                val effectiveRatio = if (lensType == LensType.ULTRAWIDE) 0.5f else opticalRatio
+
+                val displayName = when (lensType) {
+                    LensType.FRONT -> "Front Selfie (f/${maxAperture})"
+                    LensType.ULTRAWIDE -> "0.5x Ultra Wide (${focalMm}mm f/${maxAperture})"
+                    LensType.WIDE -> "1x Wide (${focalMm}mm f/${maxAperture})"
+                    LensType.TELEPHOTO -> "${opticalRatio}x Telephoto (${focalMm}mm f/${maxAperture})"
+                    LensType.TELEPHOTO_3X -> "${opticalRatio}x Telephoto (${focalMm}mm f/${maxAperture})"
+                    LensType.MACRO -> "Macro (${focalMm}mm)"
+                }
+
+                lenses.add(
+                    LensInfo(
+                        cameraId = id,
+                        facing = facing,
+                        lensType = lensType,
+                        displayName = displayName,
+                        focalLengthMm = focalMm,
+                        maxAperture = maxAperture,
+                        isPhysical = true,
+                        isHiddenAux = !isOfficial,
+                        isZoomPreset = false,
+                        baseZoomRatio = effectiveRatio,
+                        minZoomRatio = if (lensType == LensType.ULTRAWIDE) 0.5f else if (lensType == LensType.FRONT) 0.8f else 1.0f,
+                        fovDegrees = fovDegrees,
+                        equivalent35mmFocalMm = eq35mm,
+                        isIndependentCamera = true,
+                        supportsPhysicalStream = false,
+                        intrinsicZoomRatio = effectiveRatio,
+                        maxZoomRatio = primaryBackMaxZoom,
+                        idTypeDescription = if (!isOfficial) "Aux Camera ID $id" else "Camera ID $id"
+                    )
+                )
+            }
+
+            // Ensure Front Camera exists
+            val hasFront = lenses.any { it.facing == CameraCharacteristics.LENS_FACING_FRONT }
+            if (!hasFront) {
+                lenses.add(
+                    LensInfo(
+                        cameraId = primaryFrontId,
+                        facing = CameraCharacteristics.LENS_FACING_FRONT,
+                        lensType = LensType.FRONT,
+                        displayName = "Front Selfie Camera",
+                        focalLengthMm = 3.5f,
+                        maxAperture = 2.0f,
+                        isPhysical = true,
+                        isHiddenAux = false,
+                        isZoomPreset = false,
+                        baseZoomRatio = 1.0f,
+                        minZoomRatio = 0.8f,
+                        fovDegrees = 85f,
+                        equivalent35mmFocalMm = 22f,
+                        isIndependentCamera = true,
+                        supportsPhysicalStream = false,
+                        intrinsicZoomRatio = 1.0f,
+                        idTypeDescription = "Front Camera (1x)"
+                    )
+                )
+            }
+
+            // Clean sorting:
+            // 1. Back Ultra-Wide (0.5x)
+            // 2. Back Main Wide (1x)
+            // 3. Back Telephoto (2x / 3x)
+            // 4. Back Macro
+            // 5. Front Selfie
+            val sortedLenses = lenses.distinctBy {
+                "${it.cameraId}_${it.facing}_${it.lensType.name}_${it.physicalCameraId}"
+            }.sortedWith(
+                compareBy<LensInfo> { it.facing }
+                    .thenBy {
+                        when (it.lensType) {
+                            LensType.ULTRAWIDE -> 0
+                            LensType.WIDE -> 1
+                            LensType.TELEPHOTO -> 2
+                            LensType.TELEPHOTO_3X -> 3
+                            LensType.MACRO -> 4
+                            LensType.FRONT -> 5
+                        }
+                    }
+                    .thenBy { it.baseZoomRatio }
+                    .thenBy { if (it.isPrimaryMain) 0 else 1 }
+            )
+
+            return CameraInventory(
+                lenses = sortedLenses,
+                logicalToPhysicalMap = logicalToPhysical,
+                physicalToLogicalMap = physicalToLogical,
+                characteristicsCache = characteristicsMap
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error in CameraDiscovery", t)
+            return CameraInventory(emptyList())
+        }
+    }
+
+    /**
+     * Resolves the proper lens switching strategy between current and target lens.
+     */
+    fun resolveSwitchStrategy(currentLens: LensInfo?, targetLens: LensInfo): LensSwitchStrategy {
+        if (currentLens == null) return LensSwitchStrategy.INDEPENDENT_DEVICE
+
+        // If target requires a different openable camera ID (e.g. Back <-> Front, or different Aux camera ID)
+        if (currentLens.cameraId != targetLens.cameraId || currentLens.facing != targetLens.facing) {
+            return LensSwitchStrategy.INDEPENDENT_DEVICE
+        }
+
+        // Same underlying CameraDevice:
+        // Check if either target lens or current lens specifies a physical camera ID inside logical multi-camera
+        if (targetLens.isLogicalMultiCamera &&
+            ((targetLens.physicalCameraId != null && targetLens.supportsPhysicalStream) ||
+             (currentLens.physicalCameraId != null && currentLens.physicalCameraId != targetLens.physicalCameraId))
+        ) {
+            return LensSwitchStrategy.LOGICAL_PHYSICAL_STREAM
+        }
+
+        return LensSwitchStrategy.LOGICAL_ZOOM
+    }
+
+    /**
+     * Checks whether the logical camera device can genuinely handle the target lens and zoom ratio
+     * using CONTROL_ZOOM_RATIO without binding a dedicated physical camera stream or auxiliary camera.
+     */
+    fun canUseLogicalZoomForLens(
+        cameraId: String,
+        lens: LensInfo,
+        targetZoom: Float,
+        characteristics: CameraCharacteristics?
+    ): Boolean {
+        if (lens.cameraId != cameraId) return false
+        val chars = characteristics ?: return false
+        val isLogicalMulti = lens.isLogicalMultiCamera ||
+            (chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA
+            ) == true)
+
+        if (lens.lensType == LensType.ULTRAWIDE || targetZoom < 0.95f) {
+            // CONTROL_ZOOM_RATIO genuinely supports < 1.0x ONLY if zoomRange.lower <= 0.55f
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                if (zoomRange != null && zoomRange.lower <= 0.55f) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        if (!isLogicalMulti) {
+            return lens.physicalCameraId == null || lens.physicalCameraId == cameraId
+        }
+        if (lens.physicalCameraId == null || !lens.supportsPhysicalStream) {
+            return true
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            if (zoomRange != null) {
+                val neededRatio = minOf(lens.baseZoomRatio, targetZoom)
+                if (zoomRange.lower <= neededRatio + 0.05f) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private var hasLoggedStartupDiag = false
+
+    private fun logStartupDiagnostics(
+        cameraManager: CameraManager,
+        officialIds: List<String>,
+        candidateIds: Set<String>,
+        getChars: (String) -> CameraCharacteristics?
+    ) {
+        if (hasLoggedStartupDiag) return
+        hasLoggedStartupDiag = true
+
+        val hiddenIds = candidateIds.filter { !officialIds.contains(it) }
+        val concurrent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching {
+                cameraManager.concurrentCameraIds.map { "[${it.joinToString(",")}]" }.joinToString()
+            }.getOrDefault("none")
+        } else "unsupported"
+
+        Log.i("LensDiag", "=== LensDiag STARTUP DIAGNOSTICS ===")
+        Log.i("LensDiag", "official cameraIdList: $officialIds")
+        Log.i("LensDiag", "probed hidden aux IDs: $hiddenIds")
+        Log.i("LensDiag", "concurrentCameraIds: $concurrent")
+
+        for (id in candidateIds) {
+            val chars = getChars(id) ?: continue
+            val facing = when (chars.get(CameraCharacteristics.LENS_FACING)) {
+                CameraCharacteristics.LENS_FACING_BACK -> "BACK"
+                CameraCharacteristics.LENS_FACING_FRONT -> "FRONT"
+                CameraCharacteristics.LENS_FACING_EXTERNAL -> "EXTERNAL"
+                else -> "UNKNOWN"
+            }
+            val hwLevel = when (chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "LIMITED"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "FULL"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "LEGACY"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_3 -> "LEVEL_3"
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL -> "EXTERNAL"
+                else -> "UNKNOWN"
+            }
+            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
+            val focals = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList() ?: emptyList()
+            val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.let { "[${it.lower}, ${it.upper}]" } ?: "none"
+            } else "none"
+            val physIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                chars.physicalCameraIds
+            } else emptySet()
+
+            Log.i(
+                "LensDiag",
+                "Camera ID $id (hidden=${id in hiddenIds}): facing=$facing, hwLevel=$hwLevel, focals=$focals, sensorSize=$sensorSize, zoomRatioRange=$zoomRange, physIds=$physIds, caps=$caps"
+            )
+        }
+        Log.i("LensDiag", "=== LensDiag END ===")
+    }
+}
