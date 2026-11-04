@@ -54,9 +54,9 @@ object CameraDiscovery {
             val candidateIds = linkedSetOf<String>()
             candidateIds.addAll(officialIds)
 
-            // Probe vendor auxiliary cameras safely (0..12) that might not be in official cameraIdList
-            for (idNum in 0..12) {
-                val sId = idNum.toString()
+            // Probe vendor auxiliary cameras safely (0..24, and OEM IDs 100..102) that might not be in official cameraIdList
+            val auxProbeIds = (0..24).map { it.toString() } + listOf("100", "101", "102")
+            for (sId in auxProbeIds) {
                 if (!candidateIds.contains(sId)) {
                     val chars = getChars(sId)
                     if (chars != null) {

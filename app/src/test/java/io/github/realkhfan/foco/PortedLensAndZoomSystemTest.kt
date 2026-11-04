@@ -393,4 +393,22 @@ class PortedLensAndZoomSystemTest {
         val differentCam = CameraDiscovery.canUseLogicalZoomForLens("1", uwLens, 0.5f, null)
         assertFalse("Cannot use logical zoom on different camera ID", differentCam)
     }
+
+    @Test
+    fun testHiddenAuxiliaryLensProbing() {
+        val hiddenAuxUw = LensInfo(
+            cameraId = "2",
+            facing = CameraCharacteristics.LENS_FACING_BACK,
+            lensType = LensType.ULTRAWIDE,
+            displayName = "0.5x Ultra Wide",
+            focalLengthMm = 2.0f,
+            maxAperture = 2.2f,
+            isHiddenAux = true,
+            isIndependentCamera = true,
+            baseZoomRatio = 0.5f
+        )
+        assertTrue("Lens should be flagged as hidden auxiliary", hiddenAuxUw.isHiddenAux)
+        assertTrue("Lens should be flagged as independent camera", hiddenAuxUw.isIndependentCamera)
+        assertEquals("2", hiddenAuxUw.cameraId)
+    }
 }

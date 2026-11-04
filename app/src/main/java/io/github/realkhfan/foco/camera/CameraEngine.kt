@@ -5,18 +5,25 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.TonemapCurve
 import android.location.Location
+import android.media.Image
+import android.media.ImageReader
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -24,7 +31,9 @@ import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import android.view.TextureView
 import android.view.animation.DecelerateInterpolator
+import android.widget.FrameLayout
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresPermission
 import androidx.camera.camera2.interop.Camera2CameraControl
@@ -213,8 +222,435 @@ class CameraEngine(
     var previewView: PreviewView? = null
         set(value) {
             field = value
-            if (value != null && provider != null && camera == null) rebind()
+            if (value != null) {
+                ensureCamera2TextureView(value)
+                if (provider != null && camera == null && !isCamera2Active) rebind()
+            }
         }
+
+    // ------------------------------------------------------------------ Camera2 Engine for Hidden / Auxiliary Lenses
+    @Volatile private var isCamera2Active = false
+    private var camera2Device: CameraDevice? = null
+    private var camera2Session: CameraCaptureSession? = null
+    private var camera2RequestBuilder: CaptureRequest.Builder? = null
+    private var camera2JpegReader: ImageReader? = null
+    private var camera2YuvReader: ImageReader? = null
+    private var camera2Surface: Surface? = null
+    private var camera2TextureView: TextureView? = null
+    private val camera2Thread = HandlerThread("foco-camera2").apply { start() }
+    private val camera2Handler = Handler(camera2Thread.looper)
+    private var camera2DeviceGen = java.util.concurrent.atomic.AtomicInteger(0)
+    private var camera2SessionGen = java.util.concurrent.atomic.AtomicInteger(0)
+    private var camera2PendingStillCapture: ((Uri?, Throwable?) -> Unit)? = null
+    private var camera2PendingStillFile: File? = null
+
+    private fun ensureCamera2TextureView(view: PreviewView) {
+        if (camera2TextureView != null) return
+        val tv = TextureView(context).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            visibility = android.view.View.GONE
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                    camera2Surface?.release()
+                    camera2Surface = Surface(st)
+                    if (isCamera2Active && camera2Device != null && camera2Session == null) {
+                        createCamera2Session()
+                    }
+                }
+
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                    camera2Surface?.release()
+                    camera2Surface = Surface(st)
+                }
+
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    camera2Surface?.release()
+                    camera2Surface = null
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                    if (isSwitchingLens.get()) {
+                        val target = targetDiscoveredLens
+                        if (target != null) {
+                            firstTargetFrameArrived = true
+                            activeDiscoveredLens = target
+                            targetDiscoveredLens = null
+                            Log.i(TAG, "[CAMERA2_LENS_FRAME] First valid target preview frame arrived on Camera2 ID ${camera2Device?.id} (${target.displayName})")
+                            Log.i(TAG, "[LENS_SWITCH_SUCCESS] Switching successfully completed to ${target.displayName} at zoom ${state.zoom}")
+                        }
+                        isSwitchingLens.set(false)
+                    }
+                    val source = if (activeDiscoveredLens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+                    zoomTransitionController.onPreviewFrameAvailable(source)
+                }
+            }
+        }
+        camera2TextureView = tv
+        view.addView(tv)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCamera2(lens: LensInfo) {
+        val mgr = cameraManager ?: run {
+            isSwitchingLens.set(false)
+            state.message = "CameraManager not available"
+            return
+        }
+
+        closeCamera2(keepTexture = true)
+
+        isCamera2Active = true
+        mainHandler.post {
+            camera2TextureView?.visibility = android.view.View.VISIBLE
+        }
+
+        val openToken = camera2DeviceGen.incrementAndGet()
+        Log.i(TAG, "[CAMERA2_OPEN] Opening Camera2 device ID ${lens.cameraId} (${lens.displayName}, isHiddenAux=${lens.isHiddenAux})")
+
+        try {
+            mgr.openCamera(lens.cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(device: CameraDevice) {
+                    if (openToken != camera2DeviceGen.get() || !isCamera2Active) {
+                        try { device.close() } catch (_: Throwable) {}
+                        return
+                    }
+                    camera2Device = device
+                    boundCameraId = device.id
+                    boundPhysicalId = lens.physicalCameraId
+                    Log.i(TAG, "[CAMERA2_OPENED] Camera2 device ID ${device.id} opened successfully")
+                    createCamera2Session()
+                }
+
+                override fun onDisconnected(device: CameraDevice) {
+                    Log.w(TAG, "[CAMERA2_DISCONNECTED] Camera2 device ID ${device.id} disconnected")
+                    if (camera2Device == device) {
+                        closeCamera2(keepTexture = true)
+                    }
+                }
+
+                override fun onError(device: CameraDevice, error: Int) {
+                    val errDesc = when (error) {
+                        CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE -> "MAX_CAMERAS_IN_USE"
+                        CameraDevice.StateCallback.ERROR_CAMERA_IN_USE -> "CAMERA_IN_USE"
+                        CameraDevice.StateCallback.ERROR_CAMERA_DISABLED -> "CAMERA_DISABLED"
+                        CameraDevice.StateCallback.ERROR_CAMERA_DEVICE -> "CAMERA_DEVICE"
+                        CameraDevice.StateCallback.ERROR_CAMERA_SERVICE -> "CAMERA_SERVICE"
+                        else -> "error code $error"
+                    }
+                    Log.e(TAG, "[CAMERA2_ERROR] Camera2 device ${device.id} error: $errDesc")
+                    if (camera2Device == device || camera2Device == null) {
+                        closeCamera2(keepTexture = true)
+                        isSwitchingLens.set(false)
+                        val msg = "Failed to open Camera2 device ${lens.displayName}: $errDesc"
+                        state.message = msg
+                    }
+                }
+            }, camera2Handler)
+        } catch (t: Throwable) {
+            Log.e(TAG, "[CAMERA2_ERROR] Exception opening Camera2 device ${lens.cameraId}", t)
+            isSwitchingLens.set(false)
+            state.message = "Failed to open ${lens.displayName}: ${t.message}"
+        }
+    }
+
+    private fun createCamera2Session() {
+        val device = camera2Device ?: return
+        val surf = camera2Surface ?: return
+        val lens = targetDiscoveredLens ?: activeDiscoveredLens ?: return
+        val configToken = camera2SessionGen.incrementAndGet()
+
+        camera2JpegReader?.close()
+        camera2YuvReader?.close()
+
+        val chars = try { cameraManager?.getCameraCharacteristics(device.id) } catch (_: Throwable) { null }
+        val map = chars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+
+        val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG)?.filter {
+            abs(it.width.toFloat() / it.height - 4f / 3f) < 0.05f
+        }?.sortedByDescending { it.width.toLong() * it.height }
+        val stillSize = jpegSizes?.firstOrNull() ?: Size(4000, 3000)
+
+        val jpegReader = ImageReader.newInstance(stillSize.width, stillSize.height, ImageFormat.JPEG, 2)
+        jpegReader.setOnImageAvailableListener({ reader ->
+            val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                handleCamera2Jpeg(img)
+            } finally {
+                img.close()
+            }
+        }, camera2Handler)
+        camera2JpegReader = jpegReader
+
+        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888)?.filter {
+            abs(it.width.toFloat() / it.height - 4f / 3f) < 0.05f
+        }?.sortedByDescending { it.width.toLong() * it.height }
+        val yuvSize = yuvSizes?.firstOrNull() ?: Size(1920, 1440)
+
+        val yuvReader = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 4)
+        yuvReader.setOnImageAvailableListener({ reader ->
+            val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                handleCamera2Yuv(img)
+            } finally {
+                img.close()
+            }
+        }, camera2Handler)
+        camera2YuvReader = yuvReader
+
+        val outputSurfaces = listOf(surf, jpegReader.surface, yuvReader.surface)
+
+        try {
+            val reqBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surf)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+            }
+            camera2RequestBuilder = reqBuilder
+
+            @Suppress("DEPRECATION")
+            device.createCaptureSession(outputSurfaces, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    if (configToken != camera2SessionGen.get()) {
+                        try { session.close() } catch (_: Throwable) {}
+                        return
+                    }
+                    camera2Session = session
+                    Log.i(TAG, "[CAMERA2_SESSION] Camera2 session configured for camera ID ${device.id}")
+                    applyCamera2Pro(reqBuilder)
+                    applyCamera2Zoom(desiredZoom, reqBuilder)
+
+                    try {
+                        session.setRepeatingRequest(reqBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                                val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                                val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                                val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                                if (timestamp != null && exposure != null && iso != null) {
+                                    frameMeta[timestamp] = longArrayOf(exposure, iso.toLong())
+                                }
+                                val aeOff = request.get(CaptureRequest.CONTROL_AE_MODE) == CameraMetadata.CONTROL_AE_MODE_OFF
+                                if (!aeOff && exposure != null && iso != null) {
+                                    meteredShutterNs = exposure
+                                    meteredIso = iso
+                                }
+
+                                if (isSwitchingLens.get()) {
+                                    val target = targetDiscoveredLens
+                                    if (target != null) {
+                                        firstTargetFrameArrived = true
+                                        activeDiscoveredLens = target
+                                        targetDiscoveredLens = null
+                                        Log.i(TAG, "[CAMERA2_LENS_FRAME] First valid preview frame arrived on Camera2 ID ${device.id} (${target.displayName})")
+                                        Log.i(TAG, "[LENS_SWITCH_SUCCESS] Switching successfully completed to ${target.displayName}")
+                                    }
+                                    isSwitchingLens.set(false)
+                                }
+                                val source = if (activeDiscoveredLens?.lensType == LensType.ULTRAWIDE) PreviewStreamSource.ULTRAWIDE else PreviewStreamSource.MAIN
+                                zoomTransitionController.onPreviewFrameAvailable(source)
+
+                                val now = SystemClock.uptimeMillis()
+                                if (now - lastReadoutMs < 250) return
+                                lastReadoutMs = now
+                                val aperture = result.get(CaptureResult.LENS_APERTURE)
+                                val focus = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+                                val shutterNow = meteredShutterNs
+                                val isoNow = meteredIso
+                                mainHandler.post {
+                                    val rLens = when {
+                                        activeDiscoveredLens?.lensType == LensType.ULTRAWIDE -> LensKind.ULTRAWIDE
+                                        activeDiscoveredLens?.lensType == LensType.TELEPHOTO -> LensKind.TELEPHOTO
+                                        activeDiscoveredLens?.lensType == LensType.TELEPHOTO_3X -> LensKind.TELEPHOTO
+                                        state.zoom < 0.95f -> LensKind.ULTRAWIDE
+                                        else -> LensKind.WIDE
+                                    }
+                                    state.readout = Readout(rLens, aperture, exposure, iso, focus)
+                                    if (burst == null) {
+                                        state.dark = ShotPlanner.isDark(shutterNow, isoNow)
+                                        state.nightEstimate = ShotPlanner.autoNightSeconds(shutterNow, isoNow, ShotPlanner.motionFor(motionProvider()))
+                                    }
+                                }
+                            }
+                        }, camera2Handler)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "[CAMERA2_SESSION_ERROR] Failed setRepeatingRequest on ${device.id}", e)
+                    }
+
+                    mainHandler.post {
+                        state.cameraReady = true
+                    }
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "[CAMERA2_SESSION_ERROR] Session configuration failed on ${device.id}")
+                    isSwitchingLens.set(false)
+                    state.message = "Failed to configure Camera2 preview session"
+                }
+
+                override fun onClosed(session: CameraCaptureSession) {
+                    if (camera2Session == session) {
+                        camera2Session = null
+                    }
+                }
+            }, camera2Handler)
+        } catch (e: Exception) {
+            Log.e(TAG, "[CAMERA2_SESSION_ERROR] Exception creating capture session on ${device.id}", e)
+            isSwitchingLens.set(false)
+        }
+    }
+
+    private fun closeCamera2(keepTexture: Boolean = false) {
+        camera2DeviceGen.incrementAndGet()
+        camera2SessionGen.incrementAndGet()
+        try { camera2Session?.stopRepeating() } catch (_: Throwable) {}
+        try { camera2Session?.close() } catch (_: Throwable) {}
+        camera2Session = null
+
+        try { camera2Device?.close() } catch (_: Throwable) {}
+        camera2Device = null
+
+        camera2JpegReader?.close()
+        camera2JpegReader = null
+        camera2YuvReader?.close()
+        camera2YuvReader = null
+
+        isCamera2Active = false
+        if (!keepTexture) {
+            camera2Surface?.release()
+            camera2Surface = null
+            mainHandler.post {
+                camera2TextureView?.visibility = android.view.View.GONE
+            }
+        }
+    }
+
+    private fun applyCamera2Zoom(zoom: Float, builder: CaptureRequest.Builder? = camera2RequestBuilder) {
+        val b = builder ?: return
+        val device = camera2Device ?: return
+        val chars = try { cameraManager?.getCameraCharacteristics(device.id) } catch (_: Throwable) { null } ?: return
+        val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+
+        val sensorZoom = (zoom / zoomFactor).coerceAtLeast(1.0f)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val range = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            if (range != null) {
+                b.set(CaptureRequest.CONTROL_ZOOM_RATIO, sensorZoom.coerceIn(range.lower, range.upper))
+                return
+            }
+        }
+        val cropW = (activeArray.width() / sensorZoom).toInt()
+        val cropH = (activeArray.height() / sensorZoom).toInt()
+        val cropX = (activeArray.width() - cropW) / 2
+        val cropY = (activeArray.height() - cropH) / 2
+        b.set(CaptureRequest.SCALER_CROP_REGION, Rect(cropX, cropY, cropX + cropW, cropY + cropH))
+    }
+
+    private fun applyCamera2Pro(b: CaptureRequest.Builder? = camera2RequestBuilder) {
+        val req = b ?: return
+        val pro = state.pro
+        val override = burstOverride
+        if (override != null) {
+            if (override.exposureNs != null && override.iso != null) {
+                req.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                req.set(CaptureRequest.SENSOR_EXPOSURE_TIME, override.exposureNs)
+                req.set(CaptureRequest.SENSOR_SENSITIVITY, override.iso)
+            } else {
+                req.set(CaptureRequest.CONTROL_AE_LOCK, true)
+            }
+            req.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+        } else if (pro.shutterNs != null || pro.iso != null) {
+            val shutter = pro.shutterNs ?: meteredShutterNs
+            val iso = pro.iso ?: meteredIso
+            req.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            req.set(CaptureRequest.SENSOR_EXPOSURE_TIME, shutter)
+            req.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+        } else {
+            req.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+        }
+
+        if (pro.focusDiopters != null) {
+            req.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+            req.set(CaptureRequest.LENS_FOCUS_DISTANCE, pro.focusDiopters)
+        } else {
+            req.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        }
+
+        req.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+    }
+
+    private fun camera2CaptureStill(toFile: File?, onResult: (Uri?, Throwable?) -> Unit) {
+        val device = camera2Device ?: return onResult(null, IllegalStateException("Camera2 not open"))
+        val session = camera2Session ?: return onResult(null, IllegalStateException("Camera2 session not configured"))
+        val jpegReader = camera2JpegReader ?: return onResult(null, IllegalStateException("JPEG reader not ready"))
+
+        camera2PendingStillCapture = onResult
+        camera2PendingStillFile = toFile
+
+        try {
+            val captureBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(jpegReader.surface)
+                applyCamera2Pro(this)
+                applyCamera2Zoom(desiredZoom, this)
+                set(CaptureRequest.JPEG_ORIENTATION, targetRotation * 90)
+            }
+            session.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                    Log.e(TAG, "[CAMERA2_STILL] Capture failed: reason=${failure.reason}")
+                    mainHandler.post { onResult(null, RuntimeException("Still capture failed")) }
+                }
+            }, camera2Handler)
+        } catch (e: Exception) {
+            Log.e(TAG, "[CAMERA2_STILL] Exception during still capture", e)
+            onResult(null, e)
+        }
+    }
+
+    private fun handleCamera2Jpeg(image: Image) {
+        val callback = camera2PendingStillCapture ?: return
+        camera2PendingStillCapture = null
+        val targetFile = camera2PendingStillFile
+        camera2PendingStillFile = null
+
+        val buffer = image.planes[0].buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+
+        mainHandler.post {
+            try {
+                val uri = PhotoWriter.save(
+                    context = context,
+                    jpeg = bytes,
+                    name = MediaNaming.baseName(System.currentTimeMillis()),
+                    toFile = targetFile
+                )
+                callback(uri, null)
+            } catch (t: Throwable) {
+                callback(null, t)
+            }
+        }
+    }
+
+    private fun handleCamera2Yuv(image: Image) {
+        val proxy = Camera2ImageProxy(image)
+        try {
+            val session = burst
+            if (session != null) {
+                feedBurst(session, proxy)
+                return
+            }
+            val panorama = pano
+            if (panorama != null) {
+                panorama.offer(proxy)
+                return
+            }
+        } finally {
+            // Buffer copied synchronously in offer
+        }
+    }
     var screenFlash: ImageCapture.ScreenFlash? = null
     var locationProvider: () -> Location? = { null }
     /** Phone rotation speed in rad/s (gyroscope), for picking night exposures. */
@@ -417,6 +853,8 @@ class CameraEngine(
     }
 
     fun release() {
+        closeCamera2()
+        try { camera2Thread.quitSafely() } catch (_: Throwable) {}
         zoomTransitionController.cancelTransition()
         backgroundLensManager.release()
         burst?.stop()
@@ -908,6 +1346,19 @@ class CameraEngine(
     }
 
     fun applyFlash() {
+        if (isCamera2Active && camera2Device != null && camera2Session != null) {
+            val req = camera2RequestBuilder ?: return
+            val flashMode = when {
+                settings.flash == FlashSetting.ON -> CameraMetadata.FLASH_MODE_SINGLE
+                state.kind == CaptureKind.VIDEO && settings.torch -> CameraMetadata.FLASH_MODE_TORCH
+                else -> CameraMetadata.FLASH_MODE_OFF
+            }
+            req.set(CaptureRequest.FLASH_MODE, flashMode)
+            try {
+                camera2Session?.setRepeatingRequest(req.build(), null, camera2Handler)
+            } catch (_: Throwable) {}
+            return
+        }
         if (state.kind == CaptureKind.PHOTO) runCatching { imageCapture?.flashMode = photoFlashMode() }
         val torch = state.kind == CaptureKind.VIDEO && settings.torch && state.caps.hasFlash
         camera?.cameraControl?.enableTorch(torch)
@@ -915,6 +1366,14 @@ class CameraEngine(
 
     /** Sends the Pro values (and, during a burst, the burst's exposure) to the camera. */
     fun applyPro() {
+        if (isCamera2Active && camera2Device != null && camera2Session != null) {
+            val req = camera2RequestBuilder ?: return
+            applyCamera2Pro(req)
+            try {
+                camera2Session?.setRepeatingRequest(req.build(), null, camera2Handler)
+            } catch (_: Throwable) {}
+            return
+        }
         val cam = camera ?: return
         val caps = state.caps
         val pro = state.pro
@@ -1048,6 +1507,14 @@ class CameraEngine(
 
     fun applyZoomInternal(zoom: Float, isContinuous: Boolean) {
         state.zoom = zoom
+        if (isCamera2Active && camera2Device != null && camera2Session != null) {
+            val req = camera2RequestBuilder ?: return
+            applyCamera2Zoom(zoom, req)
+            try {
+                camera2Session?.setRepeatingRequest(req.build(), null, camera2Handler)
+            } catch (_: Throwable) {}
+            return
+        }
         val cam = camera ?: return
         val zs = cam.cameraInfo.zoomState.value
         val raw = zoom / zoomFactor
@@ -1095,6 +1562,39 @@ class CameraEngine(
             TAG,
             "[LENS_SWITCH_REQUEST] Requested lens: ${targetLens.displayName} (cameraId=${targetLens.cameraId}, physicalId=${targetLens.physicalCameraId}, type=${targetLens.lensType}) from current: ${currentLens?.displayName} via strategy: $strategy"
         )
+
+        val isHiddenAux = targetLens.isHiddenAux || (targetLens.isIndependentCamera && targetLens.cameraId != "0" && targetLens.cameraId != "1")
+        val isUw = targetLens.lensType == LensType.ULTRAWIDE
+        val cameraXHasCamera = runCatching {
+            val filter = CameraSelector.Builder().addCameraFilter { list ->
+                list.filter { runCatching { Camera2CameraInfo.from(it).cameraId == targetLens.cameraId }.getOrDefault(false) }
+            }.build()
+            provider?.hasCamera(filter) == true
+        }.getOrDefault(false)
+
+        // For hidden auxiliary lenses (e.g. vendor aux camera ID 2, 3, etc.) or when CameraX doesn't have the camera ID,
+        // or for Ultra-Wide when on a separate camera ID:
+        // Use Camera2 API directly!
+        if (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0")) {
+            Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
+            camera?.cameraInfo?.zoomState?.removeObserver(zoomObserver)
+            provider?.unbindAll()
+            camera = null
+            imageCapture = null
+            videoCapture = null
+            analysis = null
+            state.cameraReady = false
+
+            zoomFactor = targetLens.baseZoomRatio
+            openCamera2(targetLens)
+            return
+        }
+
+        // Otherwise, if switching back from Camera2 to CameraX (e.g. 0.5x -> 1x Main):
+        if (isCamera2Active) {
+            Log.i(TAG, "[LENS_SWITCH_CAMX] Closing Camera2 and returning to CameraX for ${targetLens.displayName}")
+            closeCamera2(keepTexture = false)
+        }
 
         if (settings.backgroundLensPreparation && backgroundLensManager.isStandbyReady() && backgroundLensManager.getStandbyLens()?.cameraId == targetLens.cameraId) {
             Log.i(TAG, "[LENS_SWITCH] Background lens is READY for ${targetLens.displayName}")
@@ -1144,6 +1644,36 @@ class CameraEngine(
     }
 
     fun focusAt(x: Float, y: Float, lock: Boolean) {
+        if (isCamera2Active && camera2Device != null && camera2Session != null) {
+            val req = camera2RequestBuilder ?: return
+            val chars = try { cameraManager?.getCameraCharacteristics(camera2Device!!.id) } catch (_: Throwable) { null }
+            val activeArray = chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            if (activeArray != null) {
+                val viewW = previewView?.width?.toFloat()?.coerceAtLeast(1f) ?: 1f
+                val viewH = previewView?.height?.toFloat()?.coerceAtLeast(1f) ?: 1f
+                val normX = (x / viewW).coerceIn(0f, 1f)
+                val normY = (y / viewH).coerceIn(0f, 1f)
+                val centerX = (activeArray.left + normX * activeArray.width()).toInt()
+                val centerY = (activeArray.top + normY * activeArray.height()).toInt()
+                val halfSize = (activeArray.width() * 0.05f).toInt()
+                val rect = Rect(
+                    (centerX - halfSize).coerceAtLeast(activeArray.left),
+                    (centerY - halfSize).coerceAtLeast(activeArray.top),
+                    (centerX + halfSize).coerceAtMost(activeArray.right),
+                    (centerY + halfSize).coerceAtMost(activeArray.bottom)
+                )
+                val metering = android.hardware.camera2.params.MeteringRectangle(rect, 1000)
+                req.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(metering))
+                req.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(metering))
+                req.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                try {
+                    camera2Session?.capture(req.build(), null, camera2Handler)
+                    req.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                    camera2Session?.setRepeatingRequest(req.build(), null, camera2Handler)
+                } catch (_: Throwable) {}
+            }
+            return
+        }
         val cam = camera ?: return
         val view = previewView ?: return
         val point = view.meteringPointFactory.createPoint(x, y)
@@ -1362,6 +1892,10 @@ class CameraEngine(
      * [onResult] gets the saved JPEG's URI.
      */
     fun takePhoto(toFile: File?, onResult: (Uri?, Throwable?) -> Unit) {
+        if (isCamera2Active && camera2Device != null && camera2Session != null) {
+            camera2CaptureStill(toFile, onResult)
+            return
+        }
         val capture = imageCapture ?: return onResult(null, IllegalStateException("Camera not ready"))
         capture.targetRotation = targetRotation
         if (state.kind == CaptureKind.PHOTO) runCatching { capture.flashMode = photoFlashMode() }
