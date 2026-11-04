@@ -13,6 +13,7 @@ import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.FrameLayout
+import androidx.camera.view.PreviewView
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -20,7 +21,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.view.PreviewView
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -210,31 +213,37 @@ open class MainActivity : ComponentActivity() {
             PermissionScreen(state, coordinator)
             return
         }
+        val previewOverlap by engine.zoomTransitionController.previewOverlapState.collectAsState()
+        val activePreviewSource by engine.activePreviewSource.collectAsState()
+        LaunchedEffect(previewOverlap, activePreviewSource) {
+            engine.updatePreviewOverlapState(previewOverlap, activePreviewSource)
+        }
         CameraScreen(state, settings, coordinator) { modifier ->
             AndroidView(
                 factory = { context ->
-                    // Keep CameraX PreviewView and the hidden-lens Camera2 TextureView as siblings.
-                    // PreviewView owns its internal children and may recreate them during use-case binding;
-                    // embedding our TextureView inside it lets that lifecycle destroy the Camera2 SurfaceTexture.
+                    // CameraX remains the main camera; its Preview output is rendered into a real TextureView.
+                    // The sibling TextureView is reserved for the independently streaming Ultra-Wide camera.
                     FrameLayout(context).apply {
                         clipChildren = true
                         clipToPadding = true
-
-                        val cameraXPreview = PreviewView(context).apply {
+                        val cameraXMainPreview = PreviewView(context).apply {
                             scaleType = PreviewView.ScaleType.FILL_CENTER
-                            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                         }
                         addView(
-                            cameraXPreview,
+                            cameraXMainPreview,
                             FrameLayout.LayoutParams(
                                 FrameLayout.LayoutParams.MATCH_PARENT,
                                 FrameLayout.LayoutParams.MATCH_PARENT
                             )
                         )
-
+                        engine.previewView = cameraXMainPreview
                         engine.camera2PreviewHost = this
-                        engine.previewView = cameraXPreview
                     }
+                },
+                update = {
+                    // Keep native alpha, visibility and Z ordering in sync with the VCamera overlap state.
+                    engine.updatePreviewOverlapState(previewOverlap, activePreviewSource)
                 },
                 modifier = modifier,
             )
