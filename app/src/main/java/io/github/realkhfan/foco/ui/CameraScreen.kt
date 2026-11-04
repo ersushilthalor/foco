@@ -111,6 +111,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.realkhfan.foco.R
 import io.github.realkhfan.foco.camera.ExposureMath
 import io.github.realkhfan.foco.camera.ZoomMath
 import io.github.realkhfan.foco.device.MicStatus
