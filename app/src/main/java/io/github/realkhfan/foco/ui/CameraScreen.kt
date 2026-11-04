@@ -843,7 +843,7 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
                 state.burstActive -> Unit
                 tool != null && state.proBarOpen -> ToolSlider(state, tool, actions, Modifier.padding(bottom = 4.dp))
                 state.zoomChips.size > 1 && !(state.kind == CaptureKind.PHOTO && state.photoMode == PhotoMode.PANORAMA) ->
-                    VibeCamZoomDial(state, actions, iconRotation, Modifier)
+                    VibeCamZoomSlider(state, actions, iconRotation, Modifier)
             }
         }
         Spacer(Modifier.height(8.dp))
