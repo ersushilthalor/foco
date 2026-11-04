@@ -171,6 +171,10 @@ class CameraEngine(
     @Volatile private var pendingZoomPresetTapWhileSwitching = false
     @Volatile private var pendingZoomUpdateTarget = 1f
     private var pendingZoomRunnable: Runnable? = null
+    private var lastMainPreviewFrameAtMs = 0L
+    private var lastUltraWidePreviewFrameAtMs = 0L
+    private var lensSwitchRequestedAtMs = 0L
+    private var crossfadeStartLogged = false
     private var lastZoomPreviewUpdateTimeMs = 0L
     private var firstTargetFrameArrived = false
     private var desiredZoom = 1f
@@ -2227,13 +2231,10 @@ class CameraEngine(
         // or for Ultra-Wide when on a separate camera ID:
         // Use Camera2 API directly!
         if (!isPrimaryMainCameraX && (isHiddenAux || !cameraXHasCamera || (isUw && targetLens.cameraId != "0"))) {
-            val preparedStandby = backgroundLensManager.getStandbyLens()
-            val canReuseStandbyForTarget = backgroundLensManager.isStandbyReady() &&
-                preparedStandby?.cameraId == targetLens.cameraId
-            if (!canReuseStandbyForTarget) {
-                Log.i(TAG, "[STANDBY_READY] false for target camera=${targetLens.cameraId}; releasing standby before sequential fallback")
-                backgroundLensManager.release()
-            }
+            // Reaching this branch means the CameraX-main + standby preview fast path was not
+            // eligible. Release the auxiliary session before sequentially opening this same ID.
+            Log.i(TAG, "[STANDBY_READY] fast path unavailable for target camera=${targetLens.cameraId}; using sequential fallback")
+            backgroundLensManager.release()
             Log.i(TAG, "[LENS_SWITCH_CAM2] Activating Camera2 API directly for hidden/auxiliary lens ${targetLens.displayName} (cameraId=${targetLens.cameraId})")
             val cam = camera
             if (cam != null) {
