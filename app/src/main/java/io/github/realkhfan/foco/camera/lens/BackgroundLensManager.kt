@@ -281,12 +281,17 @@ class BackgroundLensManager(
             return
         }
 
-        // Separate CameraDevices
+        // Reuse a configured session even before its first TextureView buffer has arrived.
+        // Never open the same camera a second time just because the frame-ready callback is late.
         val existingCam = standbyCameraDevice
-        if (existingCam != null && existingCam.id == secondaryLens.cameraId && standbyCaptureSession != null && isStreaming.get()) {
-            _status.value = BackgroundCameraStatus.READY_QUIET
-            Log.i(TAG, "[BACKGROUND_LENS] Reusing already prepared background stream on camera ${existingCam.id}")
+        val existingSession = standbyCaptureSession
+        if (existingCam != null && existingCam.id == secondaryLens.cameraId && existingSession != null) {
+            _status.value = if (isStreaming.get()) BackgroundCameraStatus.READY_QUIET else BackgroundCameraStatus.PREPARING
+            Log.i(TAG, "[BACKGROUND_LENS] Reusing standby session camera=${existingCam.id} streaming=${isStreaming.get()}")
             return
+        }
+        if (existingCam != null || existingSession != null || isPreparingStandby.get()) {
+            release()
         }
 
         if (!isPreparingStandby.compareAndSet(false, true)) {
@@ -371,7 +376,7 @@ class BackgroundLensManager(
                     }
                     standbyCaptureSession = session
                     isPreparingStandby.set(false)
-                    // Remain in PREPARING until the first valid frame arrives in onCaptureCompleted
+                    // Remain in PREPARING until the first valid buffer arrives from the UW TextureView
                     _status.value = BackgroundCameraStatus.PREPARING
 
                     try {
