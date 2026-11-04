@@ -837,13 +837,13 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
                 )
             }
         }
-        Box(Modifier.fillMaxWidth().height(104.dp), contentAlignment = Alignment.BottomCenter) {
+        Box(Modifier.fillMaxWidth().height(132.dp), contentAlignment = Alignment.BottomCenter) {
             val tool = state.activeTool
             when {
                 state.burstActive -> Unit
                 tool != null && state.proBarOpen -> ToolSlider(state, tool, actions, Modifier.padding(bottom = 4.dp))
                 state.zoomChips.size > 1 && !(state.kind == CaptureKind.PHOTO && state.photoMode == PhotoMode.PANORAMA) ->
-                    ZoomChips(state, actions, iconRotation, Modifier.padding(bottom = 34.dp))
+                    VibeCamZoomDial(state, actions, iconRotation, Modifier)
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -862,51 +862,6 @@ private fun BottomControls(state: AppState, settings: AppSettings, actions: Came
     }
 }
 
-@Composable
-private fun ZoomChips(state: AppState, actions: CameraActions, iconRotation: Float, modifier: Modifier) {
-    val chips = state.zoomChips
-    val selected = ZoomMath.selectedIndex(chips, state.zoom)
-    val primary = MaterialTheme.colorScheme.primary
-    val onPrimary = MaterialTheme.colorScheme.onPrimary
-    Row(
-        modifier
-            .clip(CircleShape)
-            .background(Color(0xB31E1F22))
-            .pointerInput(Unit) {
-                detectHorizontalDragGestures { change, dragAmount ->
-                    change.consume()
-                    actions.setZoom((state.zoom * exp(dragAmount / 260f)).coerceIn(state.minZoom, state.maxZoom))
-                }
-            }
-            .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        chips.forEachIndexed { i, chip ->
-            val isSelected = i == selected
-            Box(
-                Modifier
-                    .size(44.dp)
-                    .clip(CircleShape)
-                    .background(if (isSelected) primary else Color.Transparent)
-                    .clickable {
-                        actions.haptic()
-                        actions.setZoom(chip, fromChip = true)
-                    }
-                    .semantics { contentDescription = "Zoom ${ZoomMath.formatZoom(chip)}" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    ZoomMath.chipLabel(chip, state.zoom, isSelected),
-                    color = if (isSelected) onPrimary else Color.White,
-                    fontSize = if (isSelected) 14.sp else 13.sp,
-                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                    modifier = Modifier.rotate(iconRotation),
-                )
-            }
-        }
-    }
-}
 
 @Composable
 private fun ShutterRow(state: AppState, settings: AppSettings, actions: CameraActions, iconRotation: Float) {
