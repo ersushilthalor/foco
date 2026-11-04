@@ -227,11 +227,22 @@ class CameraEngine(
     private var highlightRequested = false
     private var burstTimeout: Runnable? = null
 
+    /**
+     * Stable parent for the Camera2 TextureView. It must be a sibling of PreviewView, not its child:
+     * PreviewView manages/replaces its own internal children as CameraX binds and unbinds use cases.
+     */
+    var camera2PreviewHost: FrameLayout? = null
+        set(value) {
+            field = value
+            if (value != null) ensureCamera2TextureView(value)
+        }
+
     var previewView: PreviewView? = null
         set(value) {
             field = value
             if (value != null) {
-                ensureCamera2TextureView(value)
+                val host = camera2PreviewHost ?: (value.parent as? FrameLayout)
+                host?.let { ensureCamera2TextureView(it) }
                 if (provider != null && camera == null && !isCamera2Active) rebind()
             }
         }
@@ -363,8 +374,25 @@ class CameraEngine(
         }
     }
 
-    private fun ensureCamera2TextureView(view: PreviewView) {
-        if (camera2TextureView != null) return
+    private fun ensureCamera2TextureView(host: FrameLayout) {
+        val existing = camera2TextureView
+        if (existing != null) {
+            // Reparent only when the host actually changes. Avoid churning the SurfaceTexture
+            // during ordinary PreviewView use-case rebinding.
+            if (existing.parent !== host) {
+                (existing.parent as? android.view.ViewGroup)?.removeView(existing)
+                if (existing.parent == null) {
+                    host.addView(
+                        existing,
+                        FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT,
+                            FrameLayout.LayoutParams.MATCH_PARENT
+                        )
+                    )
+                }
+            }
+            return
+        }
         val tv = TextureView(context).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -435,7 +463,8 @@ class CameraEngine(
             }
         }
         camera2TextureView = tv
-        view.addView(tv)
+        // This is a sibling overlay in the stable host, never a child of PreviewView.
+        host.addView(tv)
     }
 
     /**
@@ -472,7 +501,8 @@ class CameraEngine(
         // by the time onOpened arrives; do not rely on a later post to make a GONE view allocate it.
         backgroundLensManager.release()
         closeCamera2(keepTexture = true)
-        previewView?.let { ensureCamera2TextureView(it) }
+        camera2PreviewHost?.let { ensureCamera2TextureView(it) }
+            ?: (previewView?.parent as? FrameLayout)?.let { ensureCamera2TextureView(it) }
         camera2TextureView?.apply {
             visibility = android.view.View.VISIBLE
             alpha = 1f
