@@ -164,7 +164,7 @@ fun CameraScreen(
                 .aspectRatio(if (wide) 9f / 16f else 3f / 4f),
         ) {
             preview(Modifier.fillMaxSize())
-            ViewfinderOverlays(state, settings, actions)
+            ViewfinderOverlays(state, settings, actions, iconRotation)
         }
 
         TopBar(state, settings, actions, iconRotation, Modifier.align(Alignment.TopCenter).padding(top = statusTop))
@@ -221,7 +221,7 @@ private fun rememberIconRotation(deviceRotation: Int): Float {
 // ------------------------------------------------------------------------------------- viewfinder
 
 @Composable
-private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: CameraActions) {
+private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: CameraActions, iconRotation: Float) {
     var size by remember { mutableStateOf(IntSize.Zero) }
     val density = LocalDensity.current
     val swipeThreshold = with(density) { 70.dp.toPx() }
@@ -332,7 +332,7 @@ private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: 
             Image(
                 painter = painterResource(R.drawable.foco_vibecam_zoom_in),
                 contentDescription = null,
-                modifier = Modifier.padding(bottom = 10.dp).size(24.dp),
+                modifier = Modifier.padding(bottom = 10.dp).size(24.dp).rotate(iconRotation),
             )
             AndroidView(
                 factory = { context ->
@@ -352,7 +352,7 @@ private fun ViewfinderOverlays(state: AppState, settings: AppSettings, actions: 
             Image(
                 painter = painterResource(R.drawable.foco_vibecam_zoom_out),
                 contentDescription = null,
-                modifier = Modifier.padding(top = 10.dp, bottom = 32.dp).size(24.dp),
+                modifier = Modifier.padding(top = 10.dp, bottom = 32.dp).size(24.dp).rotate(iconRotation),
             )
         }
     }
