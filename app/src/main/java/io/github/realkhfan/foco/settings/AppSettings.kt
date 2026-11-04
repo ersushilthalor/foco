@@ -38,6 +38,8 @@ class AppSettings(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("foco_settings", Context.MODE_PRIVATE)
 
+    fun isBackgroundLensPreparationUnset(): Boolean = !prefs.contains("background_lens_prep")
+
     // Photo – General
     var flash by enumPref("flash", FlashSetting.NIGHT_AUTO)
     var timer by enumPref("timer", TimerSetting.OFF)
